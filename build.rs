@@ -1,6 +1,17 @@
 use vergen_gix::{Emitter, Gix};
 
 fn main() {
+    // Integration provenance is independent of the abbreviated public version string.
+    println!("cargo:rustc-env=HATH_MANAGER_TARGET={}", std::env::var("TARGET").unwrap_or_default());
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=HATH_MANAGER_SOURCE_COMMIT={commit}");
     // Windows manifest
     if cfg!(target_os = "windows") {
         add_manifest();

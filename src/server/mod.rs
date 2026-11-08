@@ -120,7 +120,13 @@ impl Server {
         let flood_control = option.flood_control;
 
         let provider = Arc::new(ssl_provider());
-        let cert_store = Arc::new(CertStore::new(provider.clone(), option.cert, option.sni_strict));
+        let cert_store = match CertStore::new(provider.clone(), option.cert, option.sni_strict) {
+            Ok(store) => Arc::new(store),
+            Err(_) => {
+                error!("Server TLS certificate is invalid");
+                return None;
+            }
+        };
         let handle = Arc::new(ServerHandle::new(cert_store.clone()));
 
         let acceptor = TlsAcceptor::from(Arc::new(create_ssl_config(provider.clone(), cert_store.clone())));

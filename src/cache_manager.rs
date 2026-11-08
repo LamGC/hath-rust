@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::{Duration, SystemTime},
 };
@@ -25,15 +25,16 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tempfile::TempPath;
 use tokio::{
-    fs::{DirEntry, File, copy, create_dir_all, metadata, read_dir, remove_dir_all, remove_file, rename},
+    fs::{DirEntry, File, create_dir_all, metadata, read_dir, remove_dir_all, remove_file},
     io::{AsyncReadExt, AsyncWriteExt},
     runtime::{Builder, Handle, Runtime},
     spawn,
     sync::mpsc::{UnboundedSender, channel},
-    task::{block_in_place, spawn_blocking},
+    task::{JoinHandle, block_in_place, spawn_blocking},
     time::{MissedTickBehavior, interval},
 };
 use tokio_stream::wrappers::ReadDirStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     file_reader::FileReader,
@@ -43,7 +44,91 @@ use crate::{
 
 const SIZE_100MB: u64 = 100 * 1024 * 1024;
 
+// The staging directory is on the destination filesystem. Readers keep their
+// validated temporary inode while the cache becomes visible in one rename.
+fn stage_cache_import(source: &Path, destination: &Path, expected: u64) -> Result<(), Error> {
+    let parent = destination.parent().ok_or_else(|| Error::other("cache_parent_missing"))?;
+    let staging = parent.join(".hath-import");
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(&staging) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error),
+    }
+    let metadata = std::fs::symlink_metadata(&staging)?;
+    if !metadata.is_dir() {
+        return Err(Error::other("cache_staging_invalid"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        if metadata.uid() != rustix::process::geteuid().as_raw() || metadata.mode() & 0o7777 != 0o700 {
+            return Err(Error::other("cache_staging_invalid"));
+        }
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags((rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW).bits() as i32)
+            .open(&staging)?;
+        rustix::fs::flock(&directory, rustix::fs::FlockOperation::LockExclusive)?;
+        // Crash leftovers are removed only from this reserved, private directory.
+        for entry in std::fs::read_dir(&staging)? {
+            let entry = entry?;
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if !entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".hath-cache-import-"))
+                || !metadata.is_file()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.nlink() > 2
+            {
+                return Err(Error::other("cache_staging_unexpected_entry"));
+            }
+            std::fs::remove_file(entry.path())?;
+        }
+        stage_cache_file(source, destination, &staging, expected)?;
+        directory.sync_all()?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        stage_cache_file(source, destination, &staging, expected)
+    }
+}
+fn stage_cache_file(source: &Path, destination: &Path, staging: &Path, expected: u64) -> Result<(), Error> {
+    let staged = tempfile::Builder::new()
+        .prefix(".hath-cache-import-")
+        .tempfile_in(staging)?
+        .into_temp_path();
+    std::fs::remove_file(&staged)?;
+    if std::fs::hard_link(source, &staged).is_err() {
+        std::fs::copy(source, &staged)?;
+    }
+    let file = std::fs::File::open(&staged)?;
+    if expected == 0 || file.metadata()?.len() != expected {
+        return Err(Error::other("cache_import_length_mismatch"));
+    }
+    file.sync_all()?;
+    let staging_path = staged.to_path_buf();
+    staged.persist(destination).map_err(|error| error.error)?;
+    // POSIX rename is a no-op when both paths name the same inode (repeat import).
+    match std::fs::remove_file(staging_path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
 pub struct CacheManager {
+    mutations: tokio::sync::Mutex<()>,
+    jobs: crate::cache_jobs::CacheJobs,
     cache_dir: PathBuf,
     cache_state: Mutex<HashMap<String, CacheState>>,
     cache_state_path: PathBuf,
@@ -51,6 +136,9 @@ pub struct CacheManager {
     size_limit: AtomicU64,
     io_pool: Option<Runtime>,
     metrics: Arc<Metrics>,
+    background: Mutex<Option<JoinHandle<()>>>,
+    background_stop: CancellationToken,
+    scan_complete: AtomicBool,
 }
 
 pub struct CacheConfig {
@@ -88,13 +176,16 @@ impl CacheConfig {
 
 impl CacheState {
     fn add_file(&mut self, size: u64) {
-        self.file_count += 1;
-        self.size += size;
+        self.file_count = self.file_count.saturating_add(1);
+        self.size = self.size.saturating_add(size);
     }
 
-    fn remove_file(&mut self, size: u64) {
-        self.file_count -= 1;
-        self.size -= size;
+    fn remove_file(&mut self, size: u64) -> (u64, u64) {
+        let count = u64::from(self.file_count > 0);
+        let bytes = self.size.min(size);
+        self.file_count = self.file_count.saturating_sub(1);
+        self.size = self.size.saturating_sub(size);
+        (count, bytes)
     }
 }
 
@@ -128,6 +219,8 @@ impl CacheManager {
     ) -> Result<Arc<Self>, Error> {
         let io_pool = Builder::new_multi_thread().thread_name("IO-Worker").worker_threads(20).build()?;
         let new = Arc::new(Self {
+            mutations: tokio::sync::Mutex::new(()),
+            jobs: crate::cache_jobs::CacheJobs::new(),
             cache_dir: config.cache_dir.clone(),
             cache_state: Default::default(),
             cache_state_path: config.data_dir.join("cache_state.dat"),
@@ -135,6 +228,9 @@ impl CacheManager {
             size_limit: AtomicU64::new(u64::MAX),
             io_pool: Some(io_pool),
             metrics,
+            background: Mutex::new(None),
+            background_stop: CancellationToken::new(),
+            scan_complete: AtomicBool::new(false),
         });
         new.update_settings(settings);
 
@@ -179,7 +275,8 @@ impl CacheManager {
                 info!("Start foreground cache scan due to low disk space");
             }
             new.scan_cache(static_range, 16, verify_cache).await?;
-            CacheManager::start_background_task(manager);
+            new.scan_complete.store(true, Relaxed);
+            CacheManager::start_background_task(manager, None);
         } else {
             // Background cache scan
             if verify_cache {
@@ -187,29 +284,22 @@ impl CacheManager {
             } else {
                 info!("Start background cache scan");
             }
-            spawn(async move {
-                if let Err(err) = manager.scan_cache(static_range, 4, verify_cache).await {
-                    error!("Cache scan error: {}", err);
-                    let _ = shutdown.send(());
-                }
-                CacheManager::start_background_task(manager);
-            });
+            CacheManager::start_background_task(manager, Some((static_range, verify_cache, shutdown)));
         }
 
         Ok(new)
     }
 
-    pub async fn create_temp_file(&self) -> TempPath {
+    pub async fn create_temp_file(&self) -> Result<TempPath, Error> {
         let temp_dir = self.temp_dir.clone();
         spawn_blocking(|| {
             tempfile::Builder::new()
                 .prefix("proxyfile_")
                 .tempfile_in(temp_dir)
-                .unwrap()
-                .into_temp_path()
+                .map(|file| file.into_temp_path())
         })
         .await
-        .unwrap()
+        .map_err(|_| Error::other("cache_temp_worker_failed"))?
     }
 
     pub async fn get_file(
@@ -217,6 +307,9 @@ impl CacheManager {
         info: &CacheFileInfo,
         offset: Option<u64>,
     ) -> CacheFileResult<impl Stream<Item = Result<Bytes, Error>> + use<>> {
+        if self.jobs.stopped() {
+            return CacheFileResult::NotFound;
+        }
         let path = info.to_path(&self.cache_dir);
 
         // Check exists and open file
@@ -255,26 +348,41 @@ impl CacheManager {
             return CacheFileResult::Full(file_reader.boxed());
         }
 
-        self.mark_recently_accessed(info).await;
         let cache_manager = self.clone();
         let info = info.clone();
         let (tx, mut rx) = channel::<Result<Bytes, Error>>(1);
-        tokio::spawn(async move {
+        let stop = self.jobs.token();
+        if !self.jobs.spawn(async move {
             let file_size = metadata.len();
             let mut read_off = 0;
-            let mut hasher = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
+            let mut hasher = Some(digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY));
 
             while read_off < file_size {
-                let buffer = match file_reader.read().await {
+                if tx.is_closed()||stop.is_cancelled(){return;}
+                let buffer = match tokio::select!{biased; _=stop.cancelled()=>return,result=file_reader.read()=>result} {
                     Ok(buf) => buf,
                     Err(err) => {
                         error!("Read cache file error: path={:?}, err={}", path, err);
-                        let _ = tx.send(Err(err)).await;
+                        tokio::select!{biased;_=stop.cancelled()=>(),_=tx.send(Err(err))=>()}
                         return;
                     }
                 };
+                if buffer.is_empty()||read_off.saturating_add(buffer.len() as u64)>file_size {
+                    tokio::select!{biased;_=stop.cancelled()=>(),_=tx.send(Err(Error::new(std::io::ErrorKind::UnexpectedEof,"cache_view_length_mismatch")))=>()}return;
+                }
                 read_off += buffer.len() as u64;
-                hasher.update(&buffer);
+                hasher.as_mut().unwrap().update(&buffer);
+                let last=read_off==file_size;
+                if last {
+                    let hash=hasher.take().unwrap().finish();
+                    if hash.as_ref()!=info.hash(){
+                        tokio::select!{biased;_=stop.cancelled()=>(),_=tx.send(Err(Error::new(std::io::ErrorKind::InvalidData,"cache_hash_mismatch")))=>()}
+                        cache_manager.remove_cache(&info).await;return;
+                    }
+                    // A cancelled Range/consumer must not grant a week of trust
+                    // to a file whose full integrity check never finished.
+                    cache_manager.mark_recently_accessed(&info).await;
+                }
                 if let Some(offset) = offset {
                     // Skip buffer out of request range
                     if offset < read_off {
@@ -285,19 +393,15 @@ impl CacheManager {
                             buffer = buffer.split_off(cut)
                         }
 
-                        let _ = tx.send(Ok(buffer)).await;
+                        if tokio::select!{biased; _=stop.cancelled()=>true,result=tx.send(Ok(buffer))=>result.is_err()}{return;}
                     }
                 } else {
-                    let _ = tx.send(Ok(buffer)).await;
+                    if tokio::select!{biased; _=stop.cancelled()=>true,result=tx.send(Ok(buffer))=>result.is_err()}{return;}
                 }
+                if last{return;}
             }
 
-            let hash = hasher.finish();
-            if hash.as_ref() != info.hash() {
-                warn!("Detected corrupt cache file: path={:?}, hash={:x?}, actual={:x?}", path, info.hash(), hash);
-                cache_manager.remove_cache(&info).await;
-            }
-        });
+        }) {return CacheFileResult::NotFound;}
 
         let stream = stream! {
             while let Some(item) = rx.recv().await {
@@ -312,7 +416,19 @@ impl CacheManager {
         }
     }
 
-    pub async fn import_cache(&self, info: &CacheFileInfo, file_path: &TempPath) {
+    pub async fn import_cache(&self, info: &CacheFileInfo, file_path: &TempPath) -> bool {
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        let mut observation = self
+            .metrics
+            .observation
+            .operation(crate::manager_integration::Operation::CacheImport);
+        let success = self.import_cache_inner(info, file_path).await;
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        observation.result(success);
+        success
+    }
+    async fn import_cache_inner(&self, info: &CacheFileInfo, file_path: &TempPath) -> bool {
+        let _mutation = self.mutations.lock().await;
         let path = info.to_path(&self.cache_dir);
         let dir = path.parent().unwrap();
 
@@ -320,18 +436,18 @@ impl CacheManager {
             && let Err(err) = create_dir_all(dir).await
         {
             error!("Create cache directory fail: {}", err);
-            return;
+            return false;
         }
 
-        // Try remove existing file
-        self.remove_cache(info).await;
-
-        // Importing
-        if rename(&file_path, &path).await.is_err() {
-            // Can't cross fs move file, try copy.
-            if let Err(err) = copy(file_path, &path).await {
-                error!("Import cache failed: {}", err);
-                return;
+        let old_size = async_filesize(&path).await;
+        {
+            let source = file_path.to_path_buf();
+            let destination = path.clone();
+            let expected = info.size() as u64;
+            let result = spawn_blocking(move || stage_cache_import(&source, &destination, expected)).await;
+            if !matches!(result, Ok(Ok(()))) {
+                crate::logger::event(crate::logger::Diagnostic::CacheImportFailed);
+                return false;
             }
         }
 
@@ -339,32 +455,76 @@ impl CacheManager {
         fix_permission(&path).await;
 
         if let Some(size) = async_filesize(&path).await {
+            if let Some(old_size) = old_size {
+                self.remove_accounted_size(info, old_size);
+            }
             self.cache_state.lock().entry(info.static_range()).or_default().add_file(size);
 
             self.metrics.cache_count.inc();
             self.metrics.cache_size.inc_by(size);
         }
+        true
     }
 
     pub async fn remove_cache(&self, info: &CacheFileInfo) -> Option<()> {
+        let _mutation = self.mutations.lock().await;
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        let mut observation = self
+            .metrics
+            .observation
+            .operation(crate::manager_integration::Operation::CacheDelete);
         let path = info.to_path(&self.cache_dir);
-        let metadata = metadata(&path).await.ok()?;
-        let size = async_filesize_fast(&path, &metadata).await?;
+        let metadata = match metadata(&path).await {
+            Ok(value) => value,
+            Err(error) => {
+                #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                observation.finish(if error.kind() == std::io::ErrorKind::NotFound {
+                    crate::manager_integration::Outcome::Noop
+                } else {
+                    crate::manager_integration::Outcome::Failed
+                });
+                #[cfg(not(all(feature = "manager-integration", target_os = "linux")))]
+                let _ = error;
+                return None;
+            }
+        };
+        let Some(size) = async_filesize_fast(&path, &metadata).await else {
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation.result(false);
+            return None;
+        };
 
         debug!("Delete cache: {:?}", path);
         if let Err(err) = std::fs::remove_file(&path) {
             error!("Delete cache file error: path={:?}, err={}", path, err);
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation.result(false);
             return None;
         }
 
-        if let Some(state) = self.cache_state.lock().get_mut(&info.static_range()) {
-            state.remove_file(size);
-        }
+        self.remove_accounted_size(info, size);
 
-        self.metrics.cache_count.dec();
-        self.metrics.cache_size.dec_by(size);
-
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        observation.result(true);
         Some(())
+    }
+
+    // An existing inode is not proof that this aggregate already accounted it.
+    // Recovery/scan windows must not turn an unsigned gauge into u64::MAX.
+    fn remove_accounted_size(&self, info: &CacheFileInfo, size: u64) {
+        if let Some(state) = self.cache_state.lock().get_mut(&info.static_range()) {
+            let (count, bytes) = state.remove_file(size);
+            let _ = self
+                .metrics
+                .cache_count
+                .inner()
+                .try_update(Relaxed, Relaxed, |value| Some(value.saturating_sub(count)));
+            let _ = self
+                .metrics
+                .cache_size
+                .inner()
+                .try_update(Relaxed, Relaxed, |value| Some(value.saturating_sub(bytes)));
+        }
     }
 
     pub fn update_settings(&self, settings: Arc<Settings>) {
@@ -372,9 +532,15 @@ impl CacheManager {
         info!("Set size limit to {:} GiB", size_limit / 1024 / 1024 / 1024);
         self.size_limit.store(size_limit, Relaxed);
         self.metrics.cache_capacity.set(size_limit.try_into().unwrap_or(i64::MAX));
+        self.metrics.cache_configured.store(true, Relaxed);
     }
 
     pub async fn save_state(&self) {
+        if !self.scan_complete.load(Relaxed) {
+            // Cancellation or a scan failure cannot replace the last saved state
+            // with a partially rebuilt map.
+            return;
+        }
         let mut file = match File::create(&self.cache_state_path).await {
             Ok(file) => file,
             Err(err) => {
@@ -398,22 +564,60 @@ impl CacheManager {
         self.io_pool.as_ref().map_or_else(|| Handle::current(), |rt| rt.handle().clone())
     }
 
-    fn start_background_task(new: Arc<Self>) {
+    pub async fn shutdown_background(&self) {
+        self.stop_io();
+        self.jobs.wait().await;
+        self.background_stop.cancel();
+        let task = self.background.lock().take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+    pub(crate) fn spawn_io(&self, future: impl std::future::Future<Output = ()> + Send + 'static) -> bool {
+        self.jobs.spawn(future)
+    }
+    pub(crate) fn io_stop(&self) -> tokio_util::sync::CancellationToken {
+        self.jobs.token()
+    }
+    pub(crate) fn io_stopped(&self) -> bool {
+        self.jobs.stopped()
+    }
+    pub(crate) fn stop_io(&self) {
+        self.background_stop.cancel();
+        self.jobs.close();
+    }
+
+    fn start_background_task(new: Arc<Self>, scan: Option<(Vec<String>, bool, UnboundedSender<()>)>) {
         let manager = Arc::downgrade(&new);
-        spawn(async move {
+        let stop = new.background_stop.clone();
+        let task = spawn(async move {
+            if let Some((ranges, verify, shutdown)) = scan {
+                let Some(manager) = manager.upgrade() else { return };
+                let result =
+                    tokio::select! { biased; _ = stop.cancelled() => return, result = manager.scan_cache(ranges, 4, verify) => result };
+                if let Err(err) = result {
+                    error!("Cache scan error: {}", err);
+                    let _ = shutdown.send(());
+                    return;
+                }
+                manager.scan_complete.store(true, Relaxed);
+            }
             // Check cache size every 10min
             let mut interval = interval(Duration::from_mins(10));
             interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                interval.tick().await;
+                tokio::select! { biased; _ = stop.cancelled() => break, _ = interval.tick() => () }
                 if let Some(manager) = manager.upgrade() {
                     manager.save_state().await;
-                    manager.check_cache_usage().await;
+                    if !stop.is_cancelled() {
+                        manager.check_cache_usage().await;
+                    }
                 } else {
                     break;
                 }
             }
         });
+        *new.background.lock() = Some(task);
     }
 
     async fn mark_recently_accessed(&self, info: &CacheFileInfo) {
@@ -427,6 +631,16 @@ impl CacheManager {
     }
 
     async fn scan_cache(&self, static_range: Vec<String>, parallelism: usize, verify_cache: bool) -> Result<(), Error> {
+        self.metrics.cache_scan_complete.store(false, Relaxed);
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        let mut observation = self.metrics.observation.operation(crate::manager_integration::Operation::CacheScan);
+        let result = self.scan_cache_inner(static_range, parallelism, verify_cache).await;
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        observation.result(result.is_ok());
+        self.metrics.cache_scan_complete.store(result.is_ok(), Relaxed);
+        result
+    }
+    async fn scan_cache_inner(&self, static_range: Vec<String>, parallelism: usize, verify_cache: bool) -> Result<(), Error> {
         let mut dirs = Vec::with_capacity(static_range.len());
 
         let mut root = read_dir(&self.cache_dir).await?;
@@ -465,7 +679,12 @@ impl CacheManager {
         for (sr, path) in dirs.into_iter() {
             // Check old state match
             let file_count = match open_dir(&path).await {
-                Some(stream) => stream.filter_map(|e| async { e.ok() }).count().await as u64,
+                Some(stream) => {
+                    stream
+                        .filter_map(|e| async { e.ok().filter(|entry| entry.file_name() != ".hath-import") })
+                        .count()
+                        .await as u64
+                }
                 None => continue,
             };
             if file_count == self.cache_state.lock().get(sr).map(|s| s.file_count).unwrap_or(0) {
@@ -494,6 +713,9 @@ impl CacheManager {
                     }
                     let metadata = metadata.unwrap();
                     if metadata.is_dir() {
+                        if entry.file_name() == ".hath-import" {
+                            return;
+                        }
                         warn!("Found unexpected dir in cache dir: {:?}", path);
                         return;
                     }
@@ -592,6 +814,16 @@ impl CacheManager {
     }
 
     async fn check_cache_usage(&self) {
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        let mut observation = self
+            .metrics
+            .observation
+            .operation(crate::manager_integration::Operation::CachePrune);
+        self.check_cache_usage_inner().await;
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        observation.result(true);
+    }
+    async fn check_cache_usage_inner(&self) {
         let total_size = self.cache_state.lock().values().fold(0, |acc, state| acc + state.size);
         let size_limit = self.size_limit.load(Relaxed);
         let disk_free = get_available_space(&self.cache_dir);
@@ -953,5 +1185,110 @@ impl CacheFileInfo {
 
     pub fn mime_type(&self) -> Mime {
         self.mime_type.to_mime()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn atomic_import_preserves_live_source_and_replacement_accounting() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(root.path());
+        let bytes = b"immutable-cache";
+        let hash = const_hex::encode(digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, bytes));
+        let info = CacheFileInfo::from_file_id(format!("{hash}-{}-jpg", bytes.len())).unwrap();
+        let source = manager.create_temp_file().await.unwrap();
+        std::fs::write(&source, bytes).unwrap();
+        assert!(manager.import_cache(&info, &source).await);
+        assert!(manager.import_cache(&info, &source).await);
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(std::fs::read(info.to_path(root.path())).unwrap(), bytes);
+        assert_eq!(manager.metrics.cache_count.get(), 1);
+        let staging = info.to_path(root.path()).parent().unwrap().join(".hath-import");
+        assert_eq!(std::fs::read_dir(staging).unwrap().count(), 0);
+        let short = manager.create_temp_file().await.unwrap();
+        std::fs::write(&short, b"short").unwrap();
+        assert!(!manager.import_cache(&info, &short).await);
+        assert_eq!(std::fs::read(info.to_path(root.path())).unwrap(), bytes);
+        assert_eq!(manager.metrics.cache_count.get(), 1);
+    }
+    #[tokio::test]
+    async fn existing_unaccounted_files_and_stale_aggregates_cannot_underflow() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(root.path());
+        let bytes = b"not-yet-scanned";
+        let hash = const_hex::encode(digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, bytes));
+        let info = CacheFileInfo::from_file_id(format!("{hash}-{}-jpg", bytes.len())).unwrap();
+        let path = info.to_path(root.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        assert!(manager.remove_cache(&info).await.is_some());
+        assert_eq!(manager.metrics.cache_count.get(), 0);
+        assert_eq!(manager.metrics.cache_size.get(), 0);
+        std::fs::write(&path, bytes).unwrap();
+        let source = manager.create_temp_file().await.unwrap();
+        std::fs::write(&source, bytes).unwrap();
+        assert!(manager.import_cache(&info, &source).await);
+        assert_eq!(manager.metrics.cache_count.get(), 1);
+        manager.metrics.cache_count.set(0);
+        manager.metrics.cache_size.set(0);
+        assert!(manager.remove_cache(&info).await.is_some());
+        assert_eq!(manager.metrics.cache_count.get(), 0);
+        assert_eq!(manager.metrics.cache_size.get(), 0);
+        let mut state = CacheState::default();
+        assert_eq!(state.remove_file(u64::MAX), (0, 0));
+        assert_eq!(state.file_count, 0);
+        assert_eq!(state.size, 0);
+    }
+    fn manager(root: &Path) -> CacheManager {
+        CacheManager {
+            mutations: tokio::sync::Mutex::new(()),
+            jobs: crate::cache_jobs::CacheJobs::new(),
+            cache_dir: root.into(),
+            cache_state: Default::default(),
+            cache_state_path: root.join("state"),
+            temp_dir: root.into(),
+            size_limit: AtomicU64::new(u64::MAX),
+            io_pool: None,
+            metrics: Arc::new(Metrics::new()),
+            background: Mutex::new(None),
+            background_stop: CancellationToken::new(),
+            scan_complete: AtomicBool::new(false),
+        }
+    }
+    #[tokio::test]
+    async fn interrupted_scan_cannot_truncate_saved_state() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(root.path());
+        std::fs::write(&manager.cache_state_path, b"last-complete-state").unwrap();
+        manager.save_state().await;
+        assert_eq!(std::fs::read(&manager.cache_state_path).unwrap(), b"last-complete-state");
+        manager.scan_complete.store(true, Relaxed);
+        manager.save_state().await;
+        assert!(read_state(&manager.cache_state_path).await.unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn background_maintenance_is_joined_before_shutdown_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(manager(root.path()));
+        CacheManager::start_background_task(manager.clone(), None);
+        tokio::time::timeout(Duration::from_secs(2), manager.shutdown_background())
+            .await
+            .unwrap();
+        assert!(manager.background.lock().is_none());
+        assert!(manager.background_stop.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn failed_scan_does_not_advertise_complete_cache_statistics() {
+        let root = tempfile::tempdir().unwrap();
+        let mut manager = manager(root.path());
+        manager.cache_dir = root.path().join("cache");
+        assert!(manager.scan_cache(Vec::new(), 1, false).await.is_err());
+        assert!(!manager.metrics.cache_scan_complete.load(Relaxed));
+        std::fs::create_dir(&manager.cache_dir).unwrap();
+        manager.scan_cache(Vec::new(), 1, false).await.unwrap();
+        assert!(manager.metrics.cache_scan_complete.load(Relaxed));
     }
 }

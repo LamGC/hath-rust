@@ -1,0 +1,402 @@
+{
+  "nativeTelemetryVersion": 1,
+  "supportedMetrics": [
+    "clientRunning",
+    "uptimeSeconds",
+    "nativeInflightHttpRequests",
+    "nativeCacheScanComplete",
+    "lastServerContact",
+    "nativePersistenceHealthy",
+    "nativeManagerLinkHealthy",
+    "agentSpoolDepth",
+    "agentSpoolBytes",
+    "nativeQuarantinedRecords",
+    "agentSpoolWriteFailures",
+    "agentPendingReliableEvents",
+    "nativeCacheCapacityBytes",
+    "cacheFiles",
+    "cacheBytes",
+    "cacheFreeBytes",
+    "cacheFillRatio",
+    "bytesSent",
+    "filesSent",
+    "bytesReceived",
+    "filesReceived",
+    "nativeLogDropped",
+    "nativeLogRedacted",
+    "nativeLogWriteFailures"
+  ],
+  "clientRunning": true,
+  "uptimeSeconds": 12,
+  "nativeInflightHttpRequests": 2,
+  "nativeCacheScanComplete": true,
+  "lastServerContact": 1794000000,
+  "nativePersistenceHealthy": false,
+  "nativeManagerLinkHealthy": true,
+  "agentSpoolDepth": 0,
+  "agentSpoolBytes": 16384,
+  "nativeQuarantinedRecords": 1,
+  "agentSpoolWriteFailures": 0,
+  "agentPendingReliableEvents": 0,
+  "nativeCacheCapacityBytes": 100,
+  "cacheFiles": 4,
+  "cacheBytes": 150,
+  "cacheFreeBytes": 0,
+  "cacheFillRatio": 1.5,
+  "nativeOperations": {
+    "rpc.server_stat": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.client_login": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.get_cert": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.get_blacklist": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.client_start": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.client_settings": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.srfetch": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.dlfails": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.fetchqueue": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.dlfetch": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.client_stop": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.still_alive": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.client_suspend": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.client_resume": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.overload": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "rpc.other": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "servercmd.still_alive": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "servercmd.threaded_proxy_test": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "servercmd.speed_test": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "servercmd.refresh_settings": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "servercmd.start_downloader": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "servercmd.refresh_certs": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "servercmd.other": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "cache.import": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "cache.delete": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "cache.scan": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "cache.prune": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "cache.blacklist": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "dispatch.reload_cert": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "dispatch.refresh_settings": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "dispatch.start_downloader": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "dispatch.overload": {
+      "started": 2,
+      "completed": 1,
+      "failed": 0,
+      "cancelled": 1,
+      "noop": 0,
+      "durationMicros": 1000000
+    },
+    "proxy.upstream": {
+      "started": 2,
+      "completed": 1,
+      "failed": 1,
+      "cancelled": 0,
+      "noop": 0,
+      "durationMicros": 20
+    }
+  },
+  "nativeHttpVersion": 1,
+  "nativeHttp": [
+    [
+      0,
+      0,
+      0,
+      0,
+      3,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      2,
+      1,
+      1,
+      9,
+      10
+    ],
+    [
+      0,
+      0,
+      2,
+      2,
+      1,
+      3,
+      10
+    ],
+    [
+      0,
+      0,
+      2,
+      3,
+      1,
+      2,
+      10
+    ],
+    [
+      0,
+      1,
+      0,
+      0,
+      1,
+      0,
+      0
+    ],
+    [
+      0,
+      1,
+      2,
+      1,
+      1,
+      0,
+      10
+    ]
+  ],
+  "nativeImageResponses": [
+    [
+      0,
+      0,
+      1,
+      1,
+      9,
+      10
+    ],
+    [
+      1,
+      0,
+      2,
+      1,
+      3,
+      10
+    ],
+    [
+      1,
+      1,
+      3,
+      1,
+      2,
+      10
+    ]
+  ],
+  "bytesSent": 14,
+  "filesSent": 1,
+  "bytesReceived": 14,
+  "filesReceived": 1,
+  "nativeLogDropped": 14,
+  "nativeLogRedacted": 14,
+  "nativeLogWriteFailures": 14
+}

@@ -1,0 +1,13 @@
+{
+  "protocolMajor": 1,
+  "protocolMinor": 0,
+  "sourceContract": "hath-manager/contracts/agent-protocol-v1.md",
+  "sourceRevision": "unreleased-working-tree",
+  "fixture": "agent-registration-native-v1.json",
+  "sha256": "41f05beeee7d771b4cbdd90c59e586c3e4fb48548cdb9145b537823eb621aa8a",
+  "galleryMetadata": {
+    "sourceContract": "hath-manager/contracts/gallery-metadata-v2.schema.json",
+    "fixture": "gallery-metadata-v2-rust-completed.json.template",
+    "sha256": "8c832070ca1aa4495e2cec44d4ddcb79080a8f7d0d4b7595dfcfe08178c23202"
+  }
+}

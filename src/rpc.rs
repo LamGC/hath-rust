@@ -12,7 +12,7 @@ use std::{
 };
 
 use chrono::{TimeDelta, TimeZone, Utc};
-use futures::{TryFutureExt, executor::block_on};
+use futures::TryFutureExt;
 use log::{debug, error, info, warn};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use reqwest::{IntoUrl, Url};
@@ -30,6 +30,8 @@ const DEFAULT_SERVER: &str = "rpc.hentaiathome.net";
 type RequestError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct RPCClient {
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    observation: crate::manager_integration::ObservationHandle,
     api_base: RwLock<Url>,
     clock_offset: AtomicI64,
     id: i32,
@@ -37,6 +39,8 @@ pub struct RPCClient {
     reqwest: reqwest::Client,
     rpc_servers: RwLock<Vec<String>>,
     running: AtomicBool,
+    #[cfg(all(test, feature = "manager-integration", target_os = "linux"))]
+    mock_only: AtomicBool,
     settings: Arc<Settings>,
 }
 
@@ -124,6 +128,8 @@ impl RPCClient {
 
         let host = bootstrap_server.unwrap_or(DEFAULT_SERVER);
         Self {
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation: Default::default(),
             api_base: RwLock::new(Url::parse(format!("http://{host}/16/rpc?clientbuild={API_VERSION}").as_str()).unwrap()),
             clock_offset: AtomicI64::new(0),
             id,
@@ -131,6 +137,8 @@ impl RPCClient {
             reqwest: create_http_client(Duration::from_secs(600), None, local_addr),
             rpc_servers: RwLock::new(vec![]),
             running: AtomicBool::new(false),
+            #[cfg(all(test, feature = "manager-integration", target_os = "linux"))]
+            mock_only: AtomicBool::new(false),
             settings: Arc::new(Settings {
                 size_limit: AtomicU64::new(u64::MAX),
                 throttle_bytes: AtomicU64::new(0),
@@ -143,6 +151,11 @@ impl RPCClient {
 
     pub fn id(&self) -> i32 {
         self.id
+    }
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    pub(crate) fn with_observation(mut self, observation: crate::manager_integration::ObservationHandle) -> Self {
+        self.observation = observation;
+        self
     }
 
     pub fn key(&self) -> &str {
@@ -201,14 +214,25 @@ impl RPCClient {
     }
 
     pub async fn get_cert(&self) -> Option<ParsedCert> {
-        self.reqwest
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        let mut observation = self.observation.rpc("get_cert");
+        let result = self
+            .reqwest
             .get(self.build_url("get_cert", "", None))
             .send()
             .and_then(|res| async { res.error_for_status() })
             .and_then(|res| res.bytes())
             .await
             .ok()
-            .and_then(|data| ParsedCert::from_p12(&data, &self.key))
+            .and_then(|data| ParsedCert::from_p12(&data, &self.key));
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        {
+            observation.result(result.is_some());
+            if result.is_some() {
+                self.observation.contact();
+            }
+        }
+        result
     }
 
     pub async fn get_purgelist(&self, delta_time: u64) -> Option<Vec<String>> {
@@ -331,9 +355,16 @@ The program will now terminate.
     }
 
     pub async fn fetch_queue(&self, gallery: Option<&GalleryMeta>) -> Option<Vec<String>> {
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        let mut observation = self.observation.rpc("fetchqueue");
         let additional = &gallery.map(|s| format!("{};{}", s.gid(), s.minxres())).unwrap_or_default();
         let url = self.build_url("fetchqueue", additional, Some("dl"));
         if let Ok(res) = self.send_request(url).await {
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            {
+                self.observation.contact();
+                observation.result(res.lines().next().is_some_and(|line| line != "INVALID_REQUEST"));
+            }
             debug!("Received response: {}", res);
             let lines: Vec<String> = res.lines().map(|s| s.to_string()).collect();
             match lines.first().map(String::as_str) {
@@ -344,6 +375,8 @@ The program will now terminate.
                 _ => return Some(lines),
             }
         };
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        observation.result(false);
 
         None
     }
@@ -364,13 +397,23 @@ The program will now terminate.
     }
 
     pub async fn shutdown(&self) {
-        if self.running.swap(false, Ordering::Relaxed) {
-            let _ = self.send_action("client_stop", None).await;
+        if self.running.swap(false, Ordering::Relaxed)
+            && tokio::time::timeout(Duration::from_secs(10), self.send_action("client_stop", None))
+                .await
+                .is_err()
+        {
+            warn!("Timed out notifying upstream of shutdown; continuing local cleanup");
         }
     }
 
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
+    }
+
+    #[cfg(all(test, feature = "manager-integration", target_os = "linux"))]
+    pub(crate) fn set_running_for_test(&self) {
+        self.mock_only.store(true, Ordering::Relaxed);
+        self.running.store(true, Ordering::Relaxed);
     }
 
     pub async fn still_alive(&self, resume: bool) -> bool {
@@ -407,6 +450,19 @@ The program will now terminate.
     }
 
     async fn check_stat(&self) -> Result<Option<(i32, i32)>, Error> {
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        let mut observation = self.observation.rpc("server_stat");
+        let result = self.check_stat_inner().await;
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        {
+            observation.result(result.is_ok());
+            if result.is_ok() {
+                self.observation.contact();
+            }
+        }
+        result
+    }
+    async fn check_stat_inner(&self) -> Result<Option<(i32, i32)>, Error> {
         let start_time = Instant::now();
         let body = self
             .send_request(self.build_url("server_stat", "", None))
@@ -447,6 +503,8 @@ The program will now terminate.
     }
 
     async fn send_action(&self, action: &str, additional: Option<&str>) -> Result<ApiResponse, RequestError> {
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        let mut observation = self.observation.rpc(action);
         let additional = additional.unwrap_or("");
         let mut error: RequestError = Box::new(Error::connection_error("Failed to connect to server."));
         for _ in 0..3 {
@@ -465,6 +523,11 @@ The program will now terminate.
                         self.change_server();
                         continue;
                     }
+                    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                    {
+                        self.observation.contact();
+                        observation.result(response.is_ok());
+                    }
                     return Ok(response);
                 }
                 Err(err) => {
@@ -477,6 +540,8 @@ The program will now terminate.
         }
 
         error!("Failed to send request: {}", error);
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        observation.result(false);
         Err(error)
     }
 
@@ -572,6 +637,11 @@ The program will now terminate.
     }
 
     fn change_server(&self) {
+        // A failing isolated test must never fall back from its loopback mock to EH.
+        #[cfg(all(test, feature = "manager-integration", target_os = "linux"))]
+        if self.mock_only.load(Ordering::Relaxed) {
+            return;
+        }
         let rpc_servers = self.rpc_servers.read();
 
         // Skip if no other server
@@ -597,9 +667,28 @@ The program will now terminate.
 
 impl Drop for RPCClient {
     fn drop(&mut self) {
-        if self.running.load(Ordering::Relaxed) {
-            block_on(self.send_action("client_stop", None)).unwrap();
+        if self.running.swap(false, Ordering::Relaxed) {
+            // Drop must be safe inside a single-thread Tokio executor and during unwinding.
+            // Only the explicit async shutdown path is allowed to perform network I/O.
+            warn!("RPC client dropped without explicit async shutdown; no network request made from Drop");
         }
+    }
+}
+
+#[cfg(all(test, feature = "manager-integration", target_os = "linux"))]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_running_client_does_not_block_tokio_or_attempt_network_io() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let client = RPCClient::new(1000, "AAAAAAAAAAAAAAAAAAAA", false, 0, Some(&endpoint), None);
+        client.set_running_for_test();
+        let before = std::time::Instant::now();
+        drop(client);
+        assert!(before.elapsed() < Duration::from_millis(100));
+        assert!(tokio::time::timeout(Duration::from_millis(50), listener.accept()).await.is_err());
     }
 }
 

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 2,
+  "jobKey": "2645625;org",
+  "status": "completed",
+  "gid": 2645625,
+  "galleryToken": null,
+  "minXRes": "org",
+  "title": "Example Gallery",
+  "information": "Example information\n",
+  "hath": {
+    "clientVersion": "1.19.0",
+    "clientBuild": null,
+    "jarSha256": null
+  },
+  "agent": {
+    "version": "1.0.0",
+    "adapterId": "hath-rust-native-v1"
+  },
+  "download": {
+    "directory": "${GALLERY_DIRECTORY}",
+    "completedAt": "2026-11-07T00:00:00Z"
+  },
+  "files": [
+    { "page": 1, "relativePath": "001.jpg", "expectedSha1": "949fd9276b70318262bba4b1a7a07bc0cc854b25", "size": 9 },
+    { "page": 2, "relativePath": "002.png", "expectedSha1": null, "size": 9 }
+  ],
+  "downloadAttemptId": "11111111-2222-4333-8444-555555555555"
+}

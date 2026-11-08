@@ -43,7 +43,9 @@ pub(super) async fn servercmd(
         return forbidden();
     }
 
-    match command.to_lowercase().as_str() {
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    let mut observation = data.metrics.observation.server_command(&command);
+    let response = match command.to_lowercase().as_str() {
         "still_alive" => "I feel FANTASTIC and I'm still alive".into_response(),
         "threaded_proxy_test" => {
             let additional = parse_additional(&additional);
@@ -62,6 +64,8 @@ pub(super) async fn servercmd(
             );
 
             if host.is_empty() || port == 0 || size == 0 || count == 0 || timestamp == 0 || token.is_empty() {
+                #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                observation.result(false);
                 return StatusCode::BAD_REQUEST.into_response();
             }
 
@@ -123,17 +127,33 @@ pub(super) async fn servercmd(
                 .unwrap_or(1000000),
         ),
         "refresh_settings" => {
-            let _ = data.command_channel.send(Command::RefreshSettings).await; // Ignore error
+            let accepted = data.command_channel.send(Command::RefreshSettings).await.is_ok();
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation.result(accepted);
+            let _ = accepted;
             Response::default()
         }
         "start_downloader" => {
-            let _ = data.command_channel.send(Command::StartDownloader).await; // Ignore error
+            let accepted = data.command_channel.send(Command::StartDownloader).await.is_ok();
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation.result(accepted);
+            let _ = accepted;
             Response::default()
         }
         "refresh_certs" => {
-            let _ = data.command_channel.send(Command::ReloadCert).await; // Ignore error
+            let accepted = data.command_channel.send(Command::ReloadCert).await.is_ok();
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation.result(accepted);
+            let _ = accepted;
             Response::default()
         }
-        _ => "INVALID_COMMAND".into_response(),
-    }
+        _ => {
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation.result(false);
+            "INVALID_COMMAND".into_response()
+        }
+    };
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    observation.result(response.status().is_success());
+    response
 }

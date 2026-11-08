@@ -19,16 +19,13 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
-use bytes::BytesMut;
 use futures::StreamExt;
 use http_range_header::parse_range_header;
-use log::error;
-use reqwest::IntoUrl;
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::watch,
-    time::{sleep, timeout},
+    time::timeout,
 };
 
 use crate::{
@@ -65,8 +62,8 @@ pub(super) async fn hath(
 
     // Parse file info
     let info = match CacheFileInfo::from_file_id(&file_id) {
-        Some(info) => info,
-        None => return not_found(),
+        Some(info) if info.size() > 0 => info,
+        _ => return not_found(),
     };
     let file_size = info.size() as u64;
     let content_type = HeaderValue::from_maybe_shared(info.mime_type().to_string()).unwrap();
@@ -127,225 +124,220 @@ pub(super) async fn hath(
     };
 
     if let Some(stream) = file_stream {
-        return if let Some(r) = range {
-            let content_length = r.end() - r.start() + 1;
-            let content_range = format!("bytes {}-{}/{}", r.start(), r.end(), file_size);
-            response
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, content_length)
-                .header(CONTENT_RANGE, content_range)
-                .status(StatusCode::PARTIAL_CONTENT)
-                .body(Body::new(TruncateBody::new(Body::from_stream(stream), content_length)))
-                .unwrap()
-        } else {
-            response
-                .header(ACCEPT_RANGES, "bytes")
-                .header(CONTENT_LENGTH, file_size)
-                .body(Body::from_stream(stream))
-                .unwrap()
-        };
+        return image_response(
+            if let Some(r) = range {
+                let content_length = r.end() - r.start() + 1;
+                let content_range = format!("bytes {}-{}/{}", r.start(), r.end(), file_size);
+                response
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header(CONTENT_LENGTH, content_length)
+                    .header(CONTENT_RANGE, content_range)
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .body(Body::new(TruncateBody::new(Body::from_stream(stream), content_length)))
+                    .unwrap()
+            } else {
+                response
+                    .header(ACCEPT_RANGES, "bytes")
+                    .header(CONTENT_LENGTH, file_size)
+                    .body(Body::new(TruncateBody::new(Body::from_stream(stream), file_size)))
+                    .unwrap()
+            },
+            true,
+            file_size,
+        );
     }
 
-    // Cache miss, proxy request
-    // Check if the file is already downloading
-    let (temp_tx, temp_rx) = watch::channel(None); // Tempfile
-    let tx = Arc::new(watch::channel(0).0); // Download progress
-    let state;
-    {
-        let mut download_state = data.download_state.lock();
-        state = download_state.get(&info.hash()).cloned();
-        // Tracking download progress
+    // Cache miss: one owned writer per hash, even when the first visitor leaves.
+    if data.cache_manager.io_stopped() {
+        return not_found();
+    }
+    let (temp_tx, temp_rx) = watch::channel(None);
+    let tx = Arc::new(watch::channel(0).0);
+    let state = {
+        let mut states = data.download_state.lock();
+        let state = states.get(&info.hash()).cloned();
         if state.is_none() {
-            download_state.insert(info.hash(), (temp_rx.clone(), tx.clone()));
+            states.insert(info.hash(), (temp_rx, tx.clone()));
         }
-    }
-
+        state
+    };
     let (temp_path, mut rx) = if let Some((mut tempfile, progress)) = state {
-        let tempfile = tempfile.wait_for(Option::is_some).await;
-        if let Err(err) = tempfile {
-            error!("Waiting tempfile create error: {}", err);
-            data.download_state.lock().remove(&info.hash());
-            return not_found();
-        }
-        (tempfile.unwrap().as_ref().unwrap().clone(), progress.subscribe())
+        let path = match timeout(Duration::from_secs(30), tempfile.wait_for(Option::is_some)).await {
+            Ok(Ok(path)) => path.as_ref().unwrap().clone(),
+            _ => return not_found(),
+        };
+        (path, progress.subscribe())
     } else {
-        // Make sure the state will be removed when cancellation.
-        let data2 = data.clone();
+        let owner = data.clone();
+        let expected = tx.clone();
         let state_guard = scopeguard::guard(info.hash(), move |hash| {
-            data2.download_state.lock().remove(&hash);
+            let mut states = owner.download_state.lock();
+            if states.get(&hash).is_some_and(|(_, current)| Arc::ptr_eq(current, &expected)) {
+                states.remove(&hash);
+            }
         });
-
-        let temp_path = Arc::new(data.cache_manager.create_temp_file().await);
+        let temp_path = match data.cache_manager.create_temp_file().await {
+            Ok(path) => Arc::new(path),
+            Err(_) => return not_found(),
+        };
         temp_tx.send_replace(Some(temp_path.clone()));
-
-        let metrics = data.metrics.clone();
         let fetch_time = Instant::now();
         let sources = match data.rpc.sr_fetch(file_index, xres, &file_id).await {
-            Some(v) => v,
-            None => return not_found(),
+            Some(sources) if !sources.is_empty() => sources,
+            _ => return not_found(),
         };
-        metrics
+        data.metrics
             .cache_received_duration
             .get_or_create(&LABEL_CACHE_FETCH_URL)
             .observe(fetch_time.elapsed().as_secs_f64());
-
-        // Download worker
-        let tx2: Arc<watch::Sender<u64>> = tx.clone();
+        let worker_data = data.clone();
         let info2 = info.clone();
-        let temp_path2 = temp_path.clone();
-        tokio::spawn(async move {
-            let download_time = Instant::now();
-            let mut hasher = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
-            let mut progress = 0;
-            let mut reqwest = data.reqwest.clone();
-            let mut sources = sources.iter().cycle();
-            let mut use_proxy = data.has_proxy;
-            'retry: for retry in 0..3 {
-                let mut file = match OpenOptions::new().write(true).create(true).truncate(false).open(&*temp_path2).await {
-                    Ok(mut f) => {
-                        if let Err(err) = f.seek(SeekFrom::Start(progress)).await {
-                            error!("Cache tempfile seek fail: {}", err);
+        let path = temp_path.clone();
+        let progress_tx = tx.clone();
+        let stop = data.cache_manager.io_stop();
+        if !data.cache_manager.spawn_io(async move {
+            let _guard = state_guard;
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            let mut observation = worker_data
+                .metrics
+                .observation
+                .operation(crate::manager_integration::Operation::ProxyUpstream);
+            let result = async {
+                let download_time = Instant::now();
+                let mut progress = 0u64;
+                let mut hasher = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
+                let mut client = worker_data.reqwest.clone();
+                let mut use_proxy = worker_data.has_proxy;
+                'retry: for retry in 0..3 {
+                    if stop.is_cancelled() {
+                        return Err(());
+                    }
+                    let mut file = OpenOptions::new().write(true).open(&*path).await.map_err(|_| ())?;
+                    file.seek(SeekFrom::Start(progress)).await.map_err(|_| ())?;
+                    let source = &sources[retry % sources.len()];
+                    let request = tokio::select! {biased;_=stop.cancelled()=>return Err(()),result=client.get(source).send()=>result};
+                    let response = match request.and_then(|response| response.error_for_status()) {
+                        Ok(response) if response.status() == StatusCode::OK => response,
+                        Ok(_) => continue,
+                        Err(error) => {
+                            if use_proxy && (error.is_connect() || retry == 1) {
+                                client = create_http_client(Duration::from_secs(30), None, worker_data.local_addr);
+                                use_proxy = false;
+                            }
                             continue;
-                        }
-                        f
-                    }
-                    Err(err) => {
-                        error!("Cache tempfile create fail: {}", err);
-                        continue;
-                    }
-                };
-
-                // Send request
-                let source = sources.next().unwrap();
-                let request = reqwest.get(source).send().await;
-                let mut stream = match request.and_then(|r| r.error_for_status()) {
-                    Ok(r) => r.bytes_stream(),
-                    Err(mut err) => {
-                        err = err_with_url(err, source);
-                        error!("Cache download request fail: {err:?}");
-
-                        // Disable proxy on connect error and third retry
-                        if use_proxy && (err.is_connect() || retry == 1) {
-                            reqwest = create_http_client(Duration::from_secs(30), None, data.local_addr);
-                            use_proxy = false;
-                        }
-
-                        continue;
-                    }
-                };
-
-                // Start download
-                let mut download = 0;
-                while let Some(bytes) = stream.next().await {
-                    let bytes = match bytes {
-                        Ok(it) => it,
-                        Err(mut err) => {
-                            err = err_with_url(err, source);
-                            error!("Cache download fail: {err:?}");
-                            continue 'retry;
                         }
                     };
-                    download += bytes.len() as u64;
-
-                    // Skip downloaded data
-                    if download <= progress {
-                        continue;
-                    }
-                    let write_size = (download - progress) as usize;
-                    let start = bytes.len() - write_size;
-                    let data = &bytes[start..];
-                    if let Err(err) = file.write_all(data).await {
-                        error!("Cache tempfile write fail: {}", err);
-                        break 'retry;
-                    }
-                    hasher.update(data);
-                    progress += write_size as u64;
-                    metrics.cache_received_size.inc_by(write_size as u64);
-                    tx2.send_replace(progress);
-                }
-                if progress == file_size {
-                    if let Err(err) = file.flush().await {
-                        error!("Cache tempfile flush fail: {}", err);
-                        break 'retry;
-                    }
-                    let hash = hasher.finish();
-                    let duration = download_time.elapsed();
-                    tx2.send_replace(progress);
-                    let _ = file.sync_all().await; // fsync
-                    drop(file); // Close file
-                    tx2.closed().await; // Wait all request done
-                    data.download_state.lock().remove(&info2.hash());
-                    if hash.as_ref() == info2.hash() {
-                        tx2.closed().await; // Wait again to avoid race conditions
-                        data.cache_manager.import_cache(&info2, &temp_path2).await;
-                        metrics.cache_received.inc();
-                        metrics
-                            .cache_received_duration
-                            .get_or_create(&LABEL_CACHE_DOWNLOAD)
-                            .observe(duration.as_secs_f64());
-                    } else {
-                        error!("Cache tempfile hash mismatch: expected: {:x?}, got: {:x?}", info2.hash(), hash);
-                    }
-                    return;
-                }
-            }
-
-            // Try remove from download state anyway
-            drop(state_guard);
-        });
-
-        (temp_path, tx.subscribe())
-    };
-
-    // Wait download start or 404
-    if *rx.borrow() == 0 && rx.changed().await.is_err() {
-        return not_found();
-    }
-
-    response
-        .header(CONTENT_LENGTH, file_size)
-        .body(Body::from_stream(stream! {
-            let mut file = File::open(temp_path.as_ref()).await.unwrap();
-            let mut read_off = 0;
-            let mut write_off = *rx.borrow();
-
-            let wait_time = Duration::from_secs(30);
-            'watch: while write_off > read_off || timeout(wait_time, rx.changed()).await.is_ok_and(|r| r.is_ok()) {
-                write_off = *rx.borrow();
-
-                let mut buffer = BytesMut::with_capacity(64*1024); // 64 KiB
-                while write_off > read_off {
-                    buffer.reserve(64*1024);
-                    match file.read_buf(&mut buffer).await {
-                        Ok(0) => {
-                            // Data may not synced to disk, retry later
-                            sleep(Duration::from_millis(10)).await;
+                    let mut stream = response.bytes_stream();
+                    let mut downloaded = 0u64;
+                    while let Some(chunk) = tokio::select! {biased;_=stop.cancelled()=>return Err(()),chunk=stream.next()=>chunk} {
+                        let chunk = match chunk {
+                            Ok(chunk) => chunk,
+                            Err(_) => continue 'retry,
+                        };
+                        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                        worker_data.metrics.observation.image_received_bytes(chunk.len() as u64);
+                        let before = downloaded;
+                        downloaded = downloaded.checked_add(chunk.len() as u64).ok_or(())?;
+                        if downloaded > file_size {
+                            return Err(());
+                        }
+                        if downloaded <= progress {
                             continue;
                         }
-                        Ok(s) => read_off += s as u64,
-                        Err(err) => yield Err(err)
+                        let skip = progress.saturating_sub(before) as usize;
+                        let bytes = &chunk[skip..];
+                        file.write_all(bytes).await.map_err(|_| ())?;
+                        hasher.update(bytes);
+                        progress += bytes.len() as u64;
+                        worker_data.metrics.cache_received_size.inc_by(bytes.len() as u64);
+                        // Never release the final byte before exact-length/hash/fsync validation.
+                        progress_tx.send_replace(progress.min(file_size.saturating_sub(1)));
                     }
-                    yield Ok(buffer.split().freeze());
-
-                    // EOF
-                    if read_off == file_size {
-                        break 'watch;
+                    if progress != file_size {
+                        continue;
                     }
+                    file.flush().await.map_err(|_| ())?;
+                    file.sync_all().await.map_err(|_| ())?;
+                    drop(file);
+                    if hasher.finish().as_ref() != info2.hash() {
+                        return Err(());
+                    }
+                    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                    worker_data.metrics.observation.image_received_file();
+                    progress_tx.send_replace(progress);
+                    // Import while readers retain the original immutable temporary inode.
+                    worker_data.cache_manager.import_cache(&info2, &path).await;
+                    worker_data.metrics.cache_received.inc();
+                    worker_data
+                        .metrics
+                        .cache_received_duration
+                        .get_or_create(&LABEL_CACHE_DOWNLOAD)
+                        .observe(download_time.elapsed().as_secs_f64());
+                    return Ok(());
+                }
+                Err(())
+            }
+            .await;
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            if !stop.is_cancelled() {
+                observation.result(result.is_ok());
+            }
+            if result.is_ok() {
+                tokio::select! {biased;_=stop.cancelled()=>(),_=progress_tx.closed()=>()}
+            }
+        }) {
+            return not_found();
+        }
+        (temp_path, tx.subscribe())
+    };
+    if *rx.borrow() == 0
+        && !timeout(Duration::from_secs(30), rx.changed())
+            .await
+            .is_ok_and(|result| result.is_ok())
+    {
+        return not_found();
+    }
+    let result = response
+        .header(CONTENT_LENGTH, file_size)
+        .body(Body::from_stream(stream! {
+            let mut file=match File::open(temp_path.as_ref()).await{Ok(file)=>file,Err(error)=>{yield Err(error);return;}};
+            let mut offset=0u64;
+            loop{
+                let available=(*rx.borrow()).min(file_size);
+                if available>offset{
+                    let mut buffer=vec![0u8;(available-offset).min(64*1024) as usize];
+                    match file.read(&mut buffer).await{
+                        Ok(0)=>{yield Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,"proxy_short_file"));return;},
+                        Ok(size)=>{offset+=size as u64;buffer.truncate(size);yield Ok(bytes::Bytes::from(buffer));},
+                        Err(error)=>{yield Err(error);return;}
+                    }
+                    if offset==file_size{return;}
+                }else if !timeout(Duration::from_secs(30),rx.changed()).await.is_ok_and(|result|result.is_ok()){
+                    yield Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,"proxy_upstream_incomplete"));return;
                 }
             }
         }))
-        .unwrap()
+        .unwrap();
+    image_response(result, false, file_size)
 }
 
-/// Helper function to add url to reqwest error
-///
-/// Some kind of reqwest error doesn't have url, so add it manually
-fn err_with_url<T: IntoUrl>(error: reqwest::Error, url: T) -> reqwest::Error {
-    if error.url().is_none()
-        && let Ok(url) = url.into_url()
+fn image_response(response: Response, local: bool, bytes: u64) -> Response {
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
     {
-        error.with_url(url)
-    } else {
-        error
+        let mut response = response;
+        response.extensions_mut().insert(crate::manager_integration::ImageResponse {
+            source: if local {
+                crate::manager_integration::ImageSource::Local
+            } else {
+                crate::manager_integration::ImageSource::Proxy
+            },
+            bytes,
+        });
+        response
+    }
+    #[cfg(not(all(feature = "manager-integration", target_os = "linux")))]
+    {
+        let _ = (local, bytes);
+        response
     }
 }

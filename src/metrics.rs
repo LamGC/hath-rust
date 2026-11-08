@@ -23,6 +23,11 @@ pub const LABEL_CACHE_DOWNLOAD: CacheFetchLabels = CacheFetchLabels {
 };
 
 pub struct Metrics {
+    pub(crate) logs: std::sync::Weak<crate::logger::LoggerConfig>,
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    pub(crate) observation: crate::manager_integration::ObservationHandle,
+    pub(crate) cache_scan_complete: std::sync::atomic::AtomicBool,
+    pub(crate) cache_configured: std::sync::atomic::AtomicBool,
     pub registry: Registry,
     pub cache_sent: Counter,
     pub cache_sent_size: Family<Vec<(String, String)>, Counter>,
@@ -89,6 +94,11 @@ impl Metrics {
         registry.register_collector(Box::new(Uptime::new()));
 
         Self {
+            logs: std::sync::Weak::new(),
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation: Default::default(),
+            cache_scan_complete: std::sync::atomic::AtomicBool::new(false),
+            cache_configured: std::sync::atomic::AtomicBool::new(false),
             registry,
             cache_sent,
             cache_sent_size,

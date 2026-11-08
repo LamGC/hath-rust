@@ -26,9 +26,8 @@ use tempfile::TempPath;
 use tokio::{
     fs::{self, File, try_exists},
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, stderr, stdin},
-    signal,
     sync::{
-        mpsc::{self, Sender, UnboundedReceiver},
+        mpsc::{self, Sender},
         watch,
     },
     time::{Instant, MissedTickBehavior, interval, sleep},
@@ -38,18 +37,22 @@ use crate::{
     cache_manager::{CacheConfig, CacheFileInfo, CacheManager},
     error::Error::ApiResponseFail,
     gallery_downloader::GalleryDownloader,
-    logger::Logger,
+    logger::{Diagnostic, Logger},
     metrics::Metrics,
     rpc::RPCClient,
     server::{Server, ServerOptions},
     util::{create_dirs, create_http_client},
 };
 
+mod cache_jobs;
 mod cache_manager;
+mod client_lifecycle;
 mod error;
 mod file_reader;
 mod gallery_downloader;
 mod logger;
+#[cfg(feature = "manager-integration")]
+mod manager_integration;
 mod metrics;
 mod middleware;
 mod route;
@@ -81,6 +84,33 @@ const MAX_KEY_TIME_DRIFT: RangeInclusive<i64> = -300..=300;
 #[derive(Parser)]
 #[command(version = VERSION)]
 struct Args {
+    /// Describe the compiled hath-manager integration without starting the client
+    #[cfg(feature = "manager-integration")]
+    #[arg(long)]
+    manager_describe: bool,
+
+    /// Emit the integration descriptor as JSON
+    #[cfg(feature = "manager-integration")]
+    #[arg(long, requires = "manager_describe")]
+    json: bool,
+
+    /// Private hath-manager runtime configuration (not a ClientKey)
+    #[cfg(feature = "manager-integration")]
+    #[arg(long)]
+    manager_config: Option<std::path::PathBuf>,
+    /// Offline recovery for a fenced historical handoff; takes the spool writer lock
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    #[arg(long,requires_all=["manager_instance_id","manager_recovery_root"],conflicts_with_all=["manager_config","manager_describe","manager_recover_spool"])]
+    manager_recover_gallery: Option<std::path::PathBuf>,
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    #[arg(long,requires="manager_instance_id",conflicts_with_all=["manager_config","manager_describe","manager_recover_gallery"])]
+    manager_recover_spool: Option<std::path::PathBuf>,
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    #[arg(long)]
+    manager_instance_id: Option<String>,
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    #[arg(long, requires = "manager_recover_gallery")]
+    manager_recovery_root: Option<std::path::PathBuf>,
     /// Overrides the port set in the client's settings
     #[arg(short, long)]
     port: Option<u16>,
@@ -203,19 +233,119 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let args = args.unwrap();
 
+    #[cfg(feature = "manager-integration")]
+    if args.manager_describe {
+        manager_integration::print_descriptor(args.json)?;
+        return Ok(());
+    }
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    if let Some(directory) = &args.manager_recover_gallery {
+        manager_integration::print_recovered_handoff(
+            directory,
+            args.manager_instance_id.as_deref().unwrap(),
+            args.manager_recovery_root.as_deref().unwrap(),
+        )?;
+        return Ok(());
+    }
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    if let Some(root) = &args.manager_recover_spool {
+        manager_integration::recover_spool_for_parent(root, args.manager_instance_id.as_deref().unwrap())?;
+        return Ok(());
+    }
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    if args.manager_instance_id.is_some() {
+        return Err("Recovery instance requires an offline recovery operation".into());
+    }
+    #[cfg(all(feature = "manager-integration", not(target_os = "linux")))]
+    if args.manager_config.is_some() {
+        return Err("Manager runtime requires Linux".into());
+    }
+
+    #[cfg(feature = "manager-integration")]
+    let managed_logging = args.manager_config.is_some();
+    #[cfg(not(feature = "manager-integration"))]
+    let managed_logging = false;
+    if managed_logging {
+        std::panic::set_hook(Box::new(|panic| {
+            let line = panic.location().map(|location| location.line()).unwrap_or(0);
+            eprintln!("event=client.panic line={line} details=redacted");
+        }));
+    }
+    let mut lifetime = client_lifecycle::ClientLifetime::default();
+    let signals = client_lifecycle::ShutdownSignals::install()?;
+    let (shutdown_send, shutdown_recv) = mpsc::unbounded_channel::<()>();
+    let signal_stop = lifetime.stop.clone();
+    lifetime.signals = Some(tokio::spawn(async move {
+        signals.wait(shutdown_recv).await;
+        signal_stop.cancel();
+    }));
+    let stop = lifetime.stop.clone();
+    let result =
+        tokio::select! { biased; _ = stop.cancelled() => Ok(()), result = run_client(args, shutdown_send, &mut lifetime) => result };
+    if result.is_err() {
+        logger::event(Diagnostic::StartupFailed);
+    }
+    lifetime.shutdown().await;
+    if managed_logging {
+        result.map_err(|error| std::io::Error::other(safe_failure(error.as_ref())).into())
+    } else {
+        result
+    }
+}
+
+async fn run_client(
+    args: Args,
+    shutdown_send: mpsc::UnboundedSender<()>,
+    lifetime: &mut client_lifecycle::ClientLifetime,
+) -> Result<(), Box<dyn Error>> {
+    // RPCClient constructs the same URL synchronously. Reject invalid input here
+    // before acquiring integration resources instead of unwinding through them.
+    if let Some(server) = &args.rpc_server_ip {
+        reqwest::Url::parse(&format!("http://{server}/16/rpc")).map_err(|_| "Invalid RPC bootstrap address")?;
+    }
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    let managed_credentials = if let Some(path) = &args.manager_config {
+        let (managed, credentials) = manager_integration::ManagedRuntime::start(path, Path::new(&args.data_dir)).await?;
+        lifetime.managed = Some(managed);
+        Some(credentials)
+    } else {
+        None
+    };
+
     create_dirs(vec![&args.data_dir, &args.cache_dir, &args.log_dir, &args.temp_dir, &args.download_dir]).await?;
 
     // Init logger
-    let mut logger = Logger::init(args.log_dir).unwrap();
+    #[cfg(feature = "manager-integration")]
+    let managed_logging = args.manager_config.is_some();
+    #[cfg(not(feature = "manager-integration"))]
+    let managed_logging = false;
+    lifetime.logger = Some(Logger::init(&args.log_dir, managed_logging)?);
+    let logger = lifetime.logger.as_ref().unwrap();
     logger
         .config()
         .write_info(!args.disable_logging)
         .flush(args.flush_log)
         .console_level(args.quiet);
 
-    let metrics = Arc::new(Metrics::new());
+    let mut metrics = Metrics::new();
+    metrics.logs = Arc::downgrade(&logger.config());
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    let metrics = {
+        let mut metrics = metrics;
+        metrics.observation = lifetime.managed.as_ref().map(|owner| owner.observations()).unwrap_or_default();
+        metrics
+    };
+    let metrics = Arc::new(metrics);
 
     info!("Hentai@Home {COMPAT_VERSION} (Rust {VERSION}) starting up");
+    logger::event(Diagnostic::Starting);
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    if lifetime.managed.as_ref().is_some_and(|owner| owner.is_degraded()) {
+        logger::event(Diagnostic::RuntimeUnavailable);
+        error!(
+            "Manager durable runtime unavailable; Gallery is paused, cache service may continue. Repair storage and restart the client."
+        );
+    }
 
     // Deprecated option handle
     if args.sni_strict {
@@ -224,15 +354,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
         // TODO remove sni-strict function
     }
 
-    let (id, key) = match read_credential(&args.data_dir).await? {
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    let credential = match managed_credentials {
+        Some(credentials) => Some(credentials),
+        None => read_credential(&args.data_dir).await?,
+    };
+    #[cfg(not(all(feature = "manager-integration", target_os = "linux")))]
+    let credential = read_credential(&args.data_dir).await?;
+    let (id, key) = match credential {
         Some(i) => i,
         None => setup(&args.data_dir).await?,
     };
-    let client =
-        Arc::new(RPCClient::new(id, &key, args.disable_ip_origin_check, args.max_connection, args.rpc_server_ip.as_deref(), args.host));
+    let client = RPCClient::new(id, &key, args.disable_ip_origin_check, args.max_connection, args.rpc_server_ip.as_deref(), args.host);
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    let client = client.with_observation(metrics.observation.clone());
+    let client = Arc::new(client);
+    lifetime.client = Some(client.clone());
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    if let Some(owner) = &mut lifetime.managed {
+        owner.observe(Arc::downgrade(&metrics), Arc::downgrade(&client));
+    }
     let init_settings = match client.login().await {
         Ok(settings) => settings,
         Err(err) => {
+            logger::event(Diagnostic::LoginFailed);
             error!("Login error: {}", err);
             if let ApiResponseFail { fail_code, .. } = &err
                 && fail_code.starts_with("FAIL_STARTUP_LOOP")
@@ -245,8 +390,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err(err.into());
         }
     };
+    logger::event(Diagnostic::LoggedIn);
 
-    let (shutdown_send, shutdown_recv) = mpsc::unbounded_channel::<()>();
     let settings = client.settings();
     logger.config().write_info(!settings.disable_logging());
     let cache_manager = CacheManager::new(
@@ -258,6 +403,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         metrics.clone(),
     )
     .await?;
+    lifetime.cache = Some(cache_manager.clone());
+    logger::event(Diagnostic::CacheReady);
 
     // Proxy
     let proxy = match args.proxy.as_ref().map(Proxy::all) {
@@ -276,7 +423,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Starting HTTP server...");
     let port = args.port.unwrap_or_else(|| init_settings.client_port());
-    let cert = client.get_cert().await.expect("Failed to get server certificate");
+    let cert = client.get_cert().await.ok_or("Failed to get server certificate")?;
     let state = AppState {
         reqwest: create_http_client(Duration::from_secs(30), proxy.clone(), args.host),
         rpc: client.clone(),
@@ -301,6 +448,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err(error::Error::ServerStartFail.into());
     };
     let server_handle = server.handle();
+    lifetime.server = Some(server);
+    logger::event(Diagnostic::HttpReady);
 
     info!("Notifying the server that we have finished starting up the client...");
     if client.connect_check(init_settings).await.is_none() {
@@ -308,51 +457,65 @@ async fn main() -> Result<(), Box<dyn Error>> {
         sleep(Duration::from_secs(5)).await;
         return Err(error::Error::ConnectTestFail.into());
     }
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    if let Some(managed) = &lifetime.managed {
+        managed.upstream_ready();
+    }
+    logger::event(Diagnostic::UpstreamReady);
 
     // Check download jobs
     client.refresh_settings().await;
 
     // Check purge list
-    if let Some(list) = client.get_purgelist(259200).await {
-        for info in list.iter().filter_map(CacheFileInfo::from_file_id) {
-            cache_manager.remove_cache(&info).await;
-        }
-    }
+    purge_cache(&client, &cache_manager, &metrics, 259200).await;
 
     info!("H@H initialization completed successfully. Starting normal operation");
 
     // Command listener
     let client2 = client.clone();
     let cache_manager2 = cache_manager.clone();
-    let downloader = Arc::new(Mutex::new(None));
-    let downloader2 = downloader.clone();
+    let downloader2 = lifetime.downloader.clone();
+    let gallery_stop2 = lifetime.stop.clone();
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    let gallery_integration = lifetime.managed.as_ref().map(|owner| owner.handle()).unwrap_or_default();
     let logger_config = logger.config();
     let metrics2 = metrics.clone();
-    tokio::spawn(async move {
+    lifetime.dispatcher = Some(tokio::spawn(async move {
         let mut last_overload = Instant::now().checked_sub(Duration::from_secs(30)).unwrap_or_else(Instant::now);
-        while let Some(command) = rx.recv().await {
+        let mut retry_certificate = None;
+        loop {
+            let command = tokio::select! {
+                biased;
+                _ = gallery_stop2.cancelled() => break,
+                command = rx.recv() => match command { Some(command) => command, None => break },
+                _ = tokio::time::sleep_until(retry_certificate.unwrap_or_else(|| Instant::now() + Duration::from_secs(86400))), if retry_certificate.is_some() => Command::ReloadCert,
+            };
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            let mut observation = metrics2.observation.operation(match &command {
+                Command::ReloadCert => manager_integration::Operation::ReloadCert,
+                Command::RefreshSettings => manager_integration::Operation::RefreshSettings,
+                Command::StartDownloader => manager_integration::Operation::StartDownloader,
+                Command::Overload => manager_integration::Operation::Overload,
+            });
             match command {
                 Command::ReloadCert => {
+                    retry_certificate = None;
                     match client2.get_cert().await {
                         Some(cert) => {
                             if let Err(err) = server_handle.update_cert(cert) {
+                                #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                                observation.result(false);
                                 error!("Update SSL cert fail: {}", err);
                                 // Retry after 10s
-                                let tx2 = tx.clone();
-                                tokio::spawn(async move {
-                                    sleep(Duration::from_secs(10)).await;
-                                    _ = tx2.send(Command::ReloadCert).await;
-                                });
+                                retry_certificate = Some(Instant::now() + Duration::from_secs(10));
                             }
                         }
                         None => {
+                            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                            observation.result(false);
                             error!("Fetch SSL cert fail");
                             // Retry after 10s
-                            let tx2 = tx.clone();
-                            tokio::spawn(async move {
-                                sleep(Duration::from_secs(10)).await;
-                                _ = tx2.send(Command::ReloadCert).await;
-                            });
+                            retry_certificate = Some(Instant::now() + Duration::from_secs(10));
                         }
                     }
                 }
@@ -364,14 +527,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 Command::StartDownloader => {
-                    let mut downloader = downloader2.lock();
-                    if downloader.is_none() {
+                    if gallery_stop2.is_cancelled() || !client2.is_running() {
+                        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                        observation.finish(manager_integration::Outcome::Noop);
+                        continue;
+                    }
+                    let previous = {
+                        let mut slot = downloader2.lock();
+                        if slot.as_ref().is_some_and(|job| job.is_finished()) {
+                            slot.take()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(previous) = previous {
+                        let _ = previous.await;
+                    }
+                    if downloader2.lock().is_none() {
                         let new = GalleryDownloader::new(client2.clone(), &args.download_dir, proxy.clone(), metrics2.clone(), args.host);
-                        let downloader3 = downloader2.clone();
-                        *downloader = Some(tokio::spawn(async move {
-                            new.run().await;
-                            *downloader3.lock() = None;
+                        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                        let new = new.with_integration(gallery_integration.clone());
+                        let stop = gallery_stop2.clone();
+                        *downloader2.lock() = Some(tokio::spawn(async move {
+                            new.run(stop).await;
                         }))
+                    } else {
+                        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                        observation.finish(manager_integration::Outcome::Noop);
                     }
                 }
                 Command::Overload => {
@@ -379,16 +561,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         last_overload = Instant::now();
                         warn!("Server overloaded!");
                         client2.notify_overload().await;
+                    } else {
+                        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                        observation.finish(manager_integration::Outcome::Noop);
                     }
                 }
             }
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            observation.result(true);
         }
-    });
+    }));
 
     // Schedule task
     let client3 = client.clone();
     let cache_manager3 = cache_manager.clone();
-    let keepalive = tokio::spawn(async move {
+    let metrics3 = metrics.clone();
+    lifetime.keepalive = Some(tokio::spawn(async move {
         let mut counter: u32 = 0;
         let mut interval = interval(Duration::from_secs(10));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -405,38 +593,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             // Check purge list every 7hr
-            if counter % 2160 == 2159
-                && let Some(list) = client3.get_purgelist(43200).await
-            {
-                for info in list.iter().filter_map(CacheFileInfo::from_file_id) {
-                    cache_manager3.remove_cache(&info).await;
-                }
+            if counter % 2160 == 2159 {
+                purge_cache(&client3, &cache_manager3, &metrics3, 43200).await;
             }
 
             counter = counter.wrapping_add(1);
             log::logger().flush(); // Flush log every 10s
         }
-    });
+    }));
 
     // Shutdown handle
-    wait_shutdown_signal(shutdown_recv).await; // TODO force shutdown
+    lifetime.wait().await?;
     info!("Shutting down...");
-    keepalive.abort();
-    client.shutdown().await;
-    if let Some(job) = downloader.lock().as_ref() {
-        job.abort();
-    }
-    info!("Shutdown in progress - please wait");
-    sleep(Duration::from_secs(15)).await;
-    server.shutdown().await;
-    cache_manager.save_state().await;
-    logger.shutdown().await;
     Ok(())
 }
 
 /**
  * main helper
  */
+async fn purge_cache(client: &RPCClient, cache: &CacheManager, metrics: &Metrics, delta: u64) {
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    let mut observation = metrics.observation.operation(manager_integration::Operation::CacheBlacklist);
+    #[cfg(not(all(feature = "manager-integration", target_os = "linux")))]
+    let _ = metrics;
+    let list = client.get_purgelist(delta).await;
+    let available = list.is_some();
+    if let Some(list) = list {
+        for info in list.iter().filter_map(CacheFileInfo::from_file_id) {
+            cache.remove_cache(&info).await;
+        }
+    }
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    observation.result(available);
+    let _ = available;
+}
+fn safe_failure(error: &(dyn Error + 'static)) -> &'static str {
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        #[cfg(feature = "manager-integration")]
+        if let Some(code) = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<manager_integration::FailureCode>())
+        {
+            return code.code();
+        }
+        return match error.kind() {
+            std::io::ErrorKind::PermissionDenied => "native.io.permission_denied",
+            std::io::ErrorKind::NotFound => "native.io.not_found",
+            std::io::ErrorKind::AlreadyExists => "native.io.already_exists",
+            std::io::ErrorKind::WouldBlock => "native.io.busy",
+            _ => "native.io.failed",
+        };
+    }
+    if let Some(error) = error.downcast_ref::<crate::error::Error>() {
+        return match error {
+            crate::error::Error::VersionTooOld => "client.version_too_old",
+            crate::error::Error::ServerStartFail => "http.start_failed",
+            crate::error::Error::ConnectTestFail => "client.startup_rejected",
+            crate::error::Error::ApiResponseFail { fail_code, .. } => {
+                if fail_code.starts_with("FAIL_STARTUP_LOOP") {
+                    "client.restart_loop"
+                } else if fail_code.starts_with("FAIL_CID_IN_USE") {
+                    "client.identity_in_use"
+                } else if fail_code.starts_with("FAIL_OTHER_CLIENT_CONNECTED") {
+                    "client.other_client_connected"
+                } else {
+                    "client.rpc_failed"
+                }
+            }
+            _ => "native.client_failed",
+        };
+    }
+    "native.client_failed"
+}
 async fn read_credential<P: AsRef<Path>>(data_path: P) -> Result<Option<(i32, String)>, Box<dyn Error>> {
     let path = data_path.as_ref().join("client_login");
     if !try_exists(&path).await? {
@@ -500,34 +728,6 @@ After registering, enter your ID and Key below to start your client.
     }
 
     Ok((id, key))
-}
-
-#[cfg(unix)]
-async fn wait_shutdown_signal(mut shutdown_channel: UnboundedReceiver<()>) {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut sigterm = signal(SignalKind::terminate()).unwrap();
-    tokio::select! {
-        _ = signal::ctrl_c() => (),
-        _ = sigterm.recv() => (),
-        _ = shutdown_channel.recv() => (),
-        else => ()
-    }
-}
-
-#[cfg(windows)]
-async fn wait_shutdown_signal(mut shutdown_channel: UnboundedReceiver<()>) {
-    use tokio::signal::windows::{ctrl_close, ctrl_shutdown};
-
-    let mut close = ctrl_close().unwrap();
-    let mut shutdown = ctrl_shutdown().unwrap();
-    tokio::select! {
-        _ = signal::ctrl_c() => (),
-        _ = close.recv() => (),
-        _ = shutdown.recv() => (),
-        _ = shutdown_channel.recv() => (),
-        else => ()
-    }
 }
 
 #[cfg(not(windows))]

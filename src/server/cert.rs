@@ -33,9 +33,9 @@ pub(super) struct CertStore {
 }
 
 impl CertStore {
-    pub fn new(provider: Arc<CryptoProvider>, cert: ParsedCert, strict: bool) -> Self {
-        let cert = ArcSwap::new(CertifiedKey::from_der(cert.certs, cert.key, &provider).unwrap().into());
-        Self { provider, cert, strict }
+    pub fn new(provider: Arc<CryptoProvider>, cert: ParsedCert, strict: bool) -> Result<Self, rustls::Error> {
+        let cert = ArcSwap::new(CertifiedKey::from_der(cert.certs, cert.key, &provider)?.into());
+        Ok(Self { provider, cert, strict })
     }
 
     pub fn update(&self, cert: ParsedCert) -> Result<(), rustls::Error> {
@@ -57,5 +57,18 @@ impl ResolvesServerCert for CertStore {
         }
 
         Some(certs.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_certificate_material_returns_an_error_instead_of_panicking() {
+        let cert = ParsedCert {
+            certs: Vec::new(),
+            key: PrivatePkcs8KeyDer::from(vec![0; 16]).into(),
+        };
+        assert!(CertStore::new(Arc::new(crate::util::ssl_provider()), cert, false).is_err());
     }
 }

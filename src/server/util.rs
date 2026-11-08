@@ -26,6 +26,23 @@ impl Deref for ClientAddr {
     }
 }
 
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use http_body::Body as _;
+    use http_body_util::{BodyExt, Full};
+    #[tokio::test]
+    async fn selected_view_stops_at_limit_and_short_body_is_an_error() {
+        let body = TruncateBody::new(Full::new(Bytes::from_static(b"abcdef")), 3);
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "abc");
+        let body = TruncateBody::new(Full::new(Bytes::from_static(b"ab")), 3);
+        assert!(body.collect().await.is_err());
+        let body = TruncateBody::new(Full::new(Bytes::new()), 0);
+        assert!(body.is_end_stream());
+        assert!(body.collect().await.unwrap().to_bytes().is_empty());
+    }
+}
+
 impl<S> FromRequestParts<S> for ClientAddr
 where
     S: Send + Sync,
@@ -114,9 +131,15 @@ where
 
     fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
+        if *this.limit == 0 {
+            return Poll::Ready(None);
+        }
         let res = match this.inner.poll_frame(cx) {
             Poll::Pending => return Poll::Pending,
-            Poll::Ready(None) => None,
+            Poll::Ready(None) => {
+                *this.limit = 0;
+                Some(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "http_view_short_body").into()))
+            }
             Poll::Ready(Some(Ok(mut frame))) => {
                 if *this.limit == 0 {
                     return Poll::Ready(None);
@@ -140,7 +163,7 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        self.limit == 0
     }
 
     fn size_hint(&self) -> SizeHint {

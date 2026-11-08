@@ -1,0 +1,24 @@
+{
+  "instanceId": "run-native",
+  "agentVersion": "1.0.0",
+  "javaVersion": null,
+  "hathVersion": "1.19.0",
+  "hathBuild": null,
+  "adapterId": "hath-rust-native-v1",
+  "peerKind": "rust_native",
+  "nativeIdentity": {
+    "implementationVersion": "1.19.0",
+    "integrationVersion": "1.0.0",
+    "buildCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "target": "x86_64-unknown-linux-gnu",
+    "artifactSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "ehCompatibilityVersion": "1.6.6"
+  },
+  "protocol": {
+    "major": 1,
+    "minor": 0,
+    "capabilities": ["events.reliable.v1", "gallery.lifecycle.v2", "gallery.metadata.v2", "client.native.v1", "native.health.v1", "telemetry.v1"],
+    "requiredCapabilities": ["events.reliable.v1", "gallery.lifecycle.v2", "gallery.metadata.v2", "client.native.v1", "native.health.v1"],
+    "outputProfile": "gallery-v2"
+  }
+}
