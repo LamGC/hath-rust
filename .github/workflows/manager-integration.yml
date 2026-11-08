@@ -1,0 +1,46 @@
+name: Manager integration
+
+on:
+  push:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/manager-integration.yml'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/manager-integration.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  linux-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prepare Rust stable
+        run: |
+          rustup update stable --no-self-update
+          rustup component add --toolchain stable clippy rustfmt
+          rustup override set stable
+      - name: Check only integration formatting
+        run: |
+          command -v openssl
+          rustfmt --edition 2024 --config-path rustfmt.toml --check src/manager_integration/mod.rs src/client_lifecycle.rs src/cache_manager.rs src/logger.rs src/gallery_downloader.rs src/file_reader.rs src/rpc.rs src/metrics.rs tests/manager_descriptor.rs tests/manager_startup.rs build.rs
+          rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --check src/server/mod.rs src/server/cert.rs
+          rustfmt --edition 2024 --config-path rustfmt.toml --config skip_children=true --check src/main.rs src/route/server_command.rs
+      - name: Check and test both feature configurations
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo clippy --locked --no-default-features --all-targets -- -D warnings
+          cargo test --locked --no-default-features

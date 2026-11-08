@@ -3,6 +3,54 @@
 
 The unofficial Hentai@Home client written in Rust.
 
+## hath-manager integration (development)
+
+This fork contains an optional `manager-integration` feature, enabled in default builds.
+It does not activate the integration unless explicitly configured. The protocol baseline
+is 1.0 and the native peer identity is distinct from a JavaAgent/JVM identity.
+
+Linux managed startup is wired and reports `launchSupported: true`. The Manager must
+pin the local ELF's SHA-256 and provide a private `--manager-config` file; missing or
+invalid credentials never trigger interactive setup. Client readiness requires upstream
+startup confirmation, not just Manager registration or a listening TLS socket.
+
+The actual executable has isolated startup/Gallery tests, including outbox degradation,
+certificate/startup failures, login cancellation, and standalone Noop operation. The
+Manager-side driver has mock-validated lifecycle/crash recovery; historical import also
+uses the actual Rust offline helper. An unavailable durable outbox pauses Gallery while
+an independent reporter sends degraded health and cache service can continue. Competing
+writers are fatal. Repair an initialization failure and restart the client to retry it.
+
+The process owner joins Gallery writers and background engines on shutdown and startup
+errors. Logger/RPC destruction does not synchronously wait for async work; explicit RPC
+shutdown bounds upstream notification to ten seconds. Without explicit Manager configuration,
+standalone operation creates no Manager connections or metadata and retains its original
+download layout. Non-Linux managed startup remains unsupported.
+
+Optional telemetry now samples native counters without scanning the cache or keeping
+per-request history. RPC, cache, authenticated servercmd and dispatch use fixed operation
+names; unknown actions share an `other` bucket. Missing metrics are explicitly unsupported,
+not zero. Telemetry failures retry independently of reliable delivery when the Session is
+still valid. HTTP Body accounting distinguishes completion, errors and cancellation;
+HEAD/304/Range cannot become full-image success. Proxy upstream validation, downstream
+views and atomic cache import are separate observations. Managed diagnostics are
+sanitized before formatting, with bounded queues, lines and rotating files.
+
+```sh
+cargo test --locked
+cargo test --locked --no-default-features
+cargo run --locked -- --manager-describe --json
+```
+
+The descriptor exits before credentials, logging, runtime directories or EH networking.
+The engine is Linux-first; it uses private owner-only files and a bounded disk outbox.
+Tests require OpenSSL to generate throwaway TLS fixtures. The parent workspace has also
+validated actual Rust → Manager → synthetic asynchronous Provider → qBittorrent → BT
+readback in both ZIP Store and directory layouts. A short 512MB no-swap experiment at
+about 96 QPS had no OOM; it does not establish million-file, 1000-QPS or production EH
+capacity. Native automatic updates, server-side bandwidth semantics and atomic cache
+state crash recovery remain separate production work.
+
 ## Install
 Read the [Wiki](https://github.com/james58899/hath-rust/wiki/Install)
 
