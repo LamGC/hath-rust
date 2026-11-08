@@ -15,8 +15,8 @@ type TaskError = (Error, File, BytesMut);
 async fn read_file(mut file: File, mut buf: BytesMut, capacity: usize) -> std::result::Result<TaskResult, TaskError> {
     // Init buffer
     buf.clear();
-    buf.reserve(capacity);
-    unsafe { buf.set_len(capacity) }; // SAFETY: File::read() only write buffer
+    // Read requires initialized memory even when the concrete reader is a File.
+    buf.resize(capacity, 0);
 
     match file.read(&mut buf) {
         Ok(size) => {
@@ -128,5 +128,22 @@ impl Stream for FileReader {
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn initialized_read_buffer_preserves_bytes_and_handles_short_reads_and_eof() {
+        let mut source = tempfile::tempfile().unwrap();
+        source.write_all(b"gallery-image").unwrap();
+        source.rewind().unwrap();
+        let (file, bytes) = read_file(source, BytesMut::new(), 64).await.unwrap();
+        assert_eq!(&bytes[..], b"gallery-image");
+        let (_, bytes) = read_file(file, bytes, 64).await.unwrap();
+        assert!(bytes.is_empty());
     }
 }
