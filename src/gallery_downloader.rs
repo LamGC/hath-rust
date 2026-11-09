@@ -554,7 +554,7 @@ async fn download<P: AsRef<Path>>(
             };
             let bytes = bytes?;
             metrics.download_size.inc_by(bytes.len() as u64);
-            #[cfg(all(feature="manager-integration",target_os="linux"))]
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
             metrics.observation.image_received_bytes(bytes.len() as u64);
             file.write_all(&bytes).await?;
             hasher.update(&bytes);
@@ -597,7 +597,7 @@ async fn download<P: AsRef<Path>>(
     .await??;
 
     metrics.download_file_count.inc();
-    #[cfg(all(feature="manager-integration",target_os="linux"))]
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
     metrics.observation.image_received_file();
     metrics.download_duration.observe(start.elapsed().as_secs_f64());
 
