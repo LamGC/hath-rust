@@ -1,5 +1,5 @@
 # hath-rust
-[![Build](../../actions/workflows/build.yml/badge.svg)](../../actions/workflows/build.yml) [![Docker Pulls](https://img.shields.io/docker/pulls/james58899/hath-rust)](https://hub.docker.com/r/james58899/hath-rust)
+[![Build](../../actions/workflows/build.yml/badge.svg)](../../actions/workflows/build.yml)
 
 The unofficial Hentai@Home client written in Rust.
 
@@ -52,6 +52,14 @@ capacity. Native automatic updates, server-side bandwidth semantics and atomic c
 state crash recovery remain separate production work.
 
 ## Install
+Native fork binaries are published on [GitHub Releases](https://github.com/LamGC/hath-rust/releases).
+Choose the asset matching your platform and verify it with `SHA256SUMS`.
+`release-manifest.json` records the release version, source commit, platform assets and hashes.
+Checksums are not a publisher signature; a signed source tag does not sign the compiled binaries.
+CI creates a **draft** for administrator review and manual publication, never a public release automatically.
+This fork no longer publishes Docker images; Dockerfiles remain for upstream maintenance.
+See [CHANGELOG.md](CHANGELOG.md) for fork changes, upstream synchronization and known limitations.
+
 Read the [Wiki](https://github.com/james58899/hath-rust/wiki/Install)
 
 ## Features

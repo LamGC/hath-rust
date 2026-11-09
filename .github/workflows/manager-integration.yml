@@ -1,6 +1,7 @@
 name: Manager integration
 
 on:
+  workflow_call:
   push:
     paths:
       - 'Cargo.toml'
@@ -9,6 +10,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - '.github/workflows/manager-integration.yml'
+      - '.github/scripts/**'
   pull_request:
     paths:
       - 'Cargo.toml'
@@ -17,6 +19,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - '.github/workflows/manager-integration.yml'
+      - '.github/scripts/**'
 
 permissions:
   contents: read
@@ -27,6 +30,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      - name: Test release validation
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - name: Prepare Rust stable
         run: |
           rustup update stable --no-self-update

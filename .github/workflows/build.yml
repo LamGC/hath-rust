@@ -1,5 +1,8 @@
 name: Build
 
+permissions:
+  contents: read
+
 on:
   push:
     branches-ignore: [ "dependabot/**" ]
@@ -73,7 +76,7 @@ jobs:
         CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "x86_64-linux-gnu-gcc"
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc"
         CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: "arm-linux-gnueabihf-gcc"
-      run: cargo build --verbose --release --target=${{ matrix.target }}
+      run: cargo build --locked --verbose --release --target=${{ matrix.target }}
     - uses: actions/upload-artifact@v7
       with:
         name: hath-rust-${{ matrix.target }}
@@ -109,7 +112,7 @@ jobs:
       if: ${{ matrix.target == 'aarch64-unknown-linux-musl' }}
       run: echo "JEMALLOC_SYS_WITH_LG_PAGE=16" >> $GITHUB_ENV
     - name: Build
-      run: cargo zigbuild --verbose --release --target=${{ matrix.target }}
+      run: cargo zigbuild --locked --verbose --release --target=${{ matrix.target }}
     - uses: actions/upload-artifact@v7
       with:
         name: hath-rust-${{ matrix.target }}
@@ -146,7 +149,7 @@ jobs:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: "rust-lld"
           CARGO_TARGET_I686_PC_WINDOWS_MSVC_LINKER: "rust-lld"
           CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER: "rust-lld"
-        run: cargo build --verbose --release --target ${{ matrix.target }}
+        run: cargo build --locked --verbose --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v7
         with:
           name: hath-rust-${{ matrix.target }}
@@ -170,9 +173,9 @@ jobs:
           rustup update
           rustup target add x86_64-apple-darwin
       - name: Build x86
-        run: cargo build --verbose --release --target x86_64-apple-darwin
+        run: cargo build --locked --verbose --release --target x86_64-apple-darwin
       - name: Build ARM64
-        run: cargo build --verbose --release --target aarch64-apple-darwin
+        run: cargo build --locked --verbose --release --target aarch64-apple-darwin
       - name: Universal binary
         run: lipo -create target/x86_64-apple-darwin/release/hath-rust target/aarch64-apple-darwin/release/hath-rust -output target/release/hath-rust
       - uses: actions/upload-artifact@v7
@@ -220,7 +223,7 @@ jobs:
         find "${ANDROID_NDK_ROOT}" -name "libunwind.a" -execdir touch libgcc.a \;
         export PATH=$PATH:${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin
         cargo install --force --locked bindgen-cli
-        cargo build --verbose --release --target=${{ matrix.target }}
+        cargo build --locked --verbose --release --target=${{ matrix.target }}
     - uses: actions/upload-artifact@v7
       with:
         name: hath-rust-${{ matrix.target }}
