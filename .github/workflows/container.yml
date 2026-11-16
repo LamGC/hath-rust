@@ -1,0 +1,179 @@
+name: Container
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'Cargo.*', 'build.rs', 'Dockerfile', '.dockerignore', '.github/workflows/container.yml', '.github/scripts/**', 'deploy/**']
+  pull_request:
+    branches: [main]
+    paths: ['src/**', 'Cargo.*', 'build.rs', 'Dockerfile', '.dockerignore', '.github/workflows/container.yml', '.github/scripts/**', 'deploy/**']
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Serialize all writers, including development and stable promotions. PRs never publish.
+concurrency:
+  group: container-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  Plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.plan.outputs.image }}
+      commit: ${{ steps.plan.outputs.commit }}
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      existing: ${{ steps.plan.outputs.existing }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || github.sha }}
+          fetch-depth: 0
+      - name: Verify published release source
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 .github/scripts/release.py check --tag "$RELEASE_TAG"
+          curl --fail --silent --show-error --location --max-time 30 https://github.com/LamGC.gpg --output "$RUNNER_TEMP/release-public-key.asc"
+          gpg --batch --import "$RUNNER_TEMP/release-public-key.asc"
+          git verify-tag --raw "$RELEASE_TAG" 2> "$RUNNER_TEMP/tag-verification.txt"
+          python3 .github/scripts/release.py verify-tag --status "$RUNNER_TEMP/tag-verification.txt"
+      - name: Fast publication policy tests
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - name: Plan immutable image
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/container.py plan
+  Build:
+    needs: Plan
+    if: needs.Plan.outputs.publish == 'true' && needs.Plan.outputs.existing == ''
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.Plan.outputs.commit }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@v4
+      - name: Build one native platform
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          build-args: HATH_BUILD_COMMIT=${{ needs.Plan.outputs.commit }}
+          labels: org.opencontainers.image.version=${{ needs.Plan.outputs.version }}
+          outputs: type=image,name=${{ needs.Plan.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=container-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=container-${{ matrix.arch }}
+          provenance: false
+      - name: Offline non-root, read-only smoke (never contacts H@H)
+        env:
+          IMAGE: ${{ format('{0}@{1}', needs.Plan.outputs.image, steps.build.outputs.digest) }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges "$IMAGE" --version
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges "$IMAGE" --manager-describe --json > "$RUNNER_TEMP/descriptor.json"
+          python3 .github/scripts/container.py smoke --descriptor "$RUNNER_TEMP/descriptor.json" --arch "$ARCH"
+      - name: Record verified digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: container-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          retention-days: 1
+          if-no-files-found: error
+  CheckPR:
+    needs: Plan
+    if: needs.Plan.outputs.publish == 'false'
+    # Separate job: even same-repository PR code receives no package write token.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.Plan.outputs.commit }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          build-args: HATH_BUILD_COMMIT=${{ needs.Plan.outputs.commit }}
+          tags: hath-rust:smoke
+          load: true
+          provenance: false
+          cache-from: type=gha,scope=container-${{ matrix.arch }}
+      - name: Offline smoke without registry credentials
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges hath-rust:smoke --version
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges hath-rust:smoke --manager-describe --json > "$RUNNER_TEMP/descriptor.json"
+          python3 .github/scripts/container.py smoke --descriptor "$RUNNER_TEMP/descriptor.json" --arch "$ARCH"
+  Publish:
+    needs: [Plan, Build]
+    if: always() && needs.Plan.result == 'success' && needs.Plan.outputs.publish == 'true' && (needs.Build.result == 'success' || needs.Plan.outputs.existing != '')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.Plan.outputs.commit }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - uses: docker/setup-buildx-action@v4
+      - uses: actions/download-artifact@v8
+        if: needs.Plan.outputs.existing == ''
+        with:
+          pattern: container-digest-*
+          path: digests
+          merge-multiple: true
+      - name: Publish immutable index and eligible rolling tag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/container.py publish

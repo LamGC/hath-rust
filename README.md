@@ -57,7 +57,10 @@ Choose the asset matching your platform and verify it with `SHA256SUMS`.
 `release-manifest.json` records the release version, source commit, platform assets and hashes.
 Checksums are not a publisher signature; a signed source tag does not sign the compiled binaries.
 CI creates a **draft** for administrator review and manual publication, never a public release automatically.
-This fork no longer publishes Docker images; Dockerfiles remain for upstream maintenance.
+The Container workflow builds standard amd64/arm64 images: default-branch development builds and manually published Releases use separate channels.
+Do not assume a tag exists until its workflow has succeeded; version tags are immutable and older releases cannot roll back `latest`.
+See [standalone container deployment](deploy/README.md) for the non-managed deployment path.
+The tiny Dockerfile remains available but is not part of the restored publishing channel.
 See [CHANGELOG.md](CHANGELOG.md) for fork changes, upstream synchronization and known limitations.
 
 Read the [Wiki](https://github.com/james58899/hath-rust/wiki/Install)

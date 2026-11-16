@@ -1,20 +1,39 @@
 use vergen_gix::{Emitter, Gix};
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=HATH_BUILD_COMMIT");
+    let supplied_commit = std::env::var("HATH_BUILD_COMMIT").ok().filter(|value| !value.is_empty());
+    if let Some(value) = &supplied_commit {
+        assert!(
+            value.len() == 40 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "HATH_BUILD_COMMIT must be a full lowercase Git SHA"
+        );
+    }
     // Integration provenance is independent of the abbreviated public version string.
     println!("cargo:rustc-env=HATH_MANAGER_TARGET={}", std::env::var("TARGET").unwrap_or_default());
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|value| value.trim().to_owned())
+    let commit = supplied_commit
+        .clone()
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|value| value.trim().to_owned())
+        })
         .unwrap_or_else(|| "unknown".into());
     println!("cargo:rustc-env=HATH_MANAGER_SOURCE_COMMIT={commit}");
     // Windows manifest
     if cfg!(target_os = "windows") {
         add_manifest();
+    }
+
+    // Container contexts deliberately exclude .git and credentials. The release
+    // workflow verifies checkout/tag provenance and supplies the exact commit.
+    if supplied_commit.is_some() {
+        println!("cargo:rustc-env=VERGEN_GIT_SHA={commit}");
+        return;
     }
 
     // Version

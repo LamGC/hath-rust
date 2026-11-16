@@ -1,0 +1,19 @@
+services:
+  hath:
+    image: ${HATH_IMAGE:?Set HATH_IMAGE to a published immutable tag or digest}
+    user: "${HATH_UID:-10001}:${HATH_GID:-10001}"
+    restart: unless-stopped
+    stop_grace_period: 2m
+    ports:
+      - "${HATH_PORT:-8080}:${HATH_PORT:-8080}/tcp"
+    volumes:
+      - ${HATH_DATA_ROOT:-/srv/hath-rust}:/hath
+    command: ["--port", "${HATH_PORT:-8080}"]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
