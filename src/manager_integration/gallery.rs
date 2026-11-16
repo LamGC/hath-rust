@@ -825,12 +825,17 @@ mod tests {
         value["download"]["directory"] = json!("${GALLERY_DIRECTORY}");
         value["download"]["completedAt"] = json!("2026-11-07T00:00:00Z");
         value["downloadAttemptId"] = json!("11111111-2222-4333-8444-555555555555");
-        let fixture: Value = serde_json::from_str(include_str!("fixtures/gallery-metadata-v2-rust-completed.json.template")).unwrap();
+        let mut fixture: Value = serde_json::from_str(include_str!("fixtures/gallery-metadata-v2-rust-completed.json.template")).unwrap();
         let provenance: Value = serde_json::from_str(include_str!("fixtures/provenance.json")).unwrap();
         assert_eq!(
             provenance["galleryMetadata"]["sha256"],
             sha256(include_bytes!("fixtures/gallery-metadata-v2-rust-completed.json.template"))
         );
+        // The shared fixture pins the wire format, not the release version.
+        // Check the emitted version before adapting the in-memory expectation;
+        // keep the fixture bytes/provenance and all other field checks intact.
+        assert_eq!(value["hath"]["clientVersion"], json!(env!("CARGO_PKG_VERSION")));
+        fixture["hath"]["clientVersion"] = json!(env!("CARGO_PKG_VERSION"));
         assert_eq!(value, fixture);
         let event = attempt.ready.clone().unwrap();
         attempt.finish(true, Vec::new()).await.unwrap();
