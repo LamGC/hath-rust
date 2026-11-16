@@ -96,7 +96,7 @@ struct Args {
 
     /// Private hath-manager runtime configuration (not a ClientKey)
     #[cfg(feature = "manager-integration")]
-    #[arg(long)]
+    #[arg(long, env = "HATH_MANAGER_CONFIG")]
     manager_config: Option<std::path::PathBuf>,
     /// Offline recovery for a fenced historical handoff; takes the spool writer lock
     #[cfg(all(feature = "manager-integration", target_os = "linux"))]
@@ -304,15 +304,32 @@ async fn run_client(
         reqwest::Url::parse(&format!("http://{server}/16/rpc")).map_err(|_| "Invalid RPC bootstrap address")?;
     }
     #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    let external = match &args.manager_config {
+        Some(path) => manager_integration::ManagedRuntime::is_external(path).await?,
+        None => false,
+    };
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
     let managed_credentials = if let Some(path) = &args.manager_config {
-        let (managed, credentials) = manager_integration::ManagedRuntime::start(path, Path::new(&args.data_dir)).await?;
-        lifetime.managed = Some(managed);
-        Some(credentials)
+        if external {
+            None
+        } else {
+            let (managed, credentials) = manager_integration::ManagedRuntime::start(path, Path::new(&args.data_dir)).await?;
+            lifetime.managed = Some(managed);
+            Some(credentials)
+        }
     } else {
         None
     };
 
     create_dirs(vec![&args.data_dir, &args.cache_dir, &args.log_dir, &args.temp_dir, &args.download_dir]).await?;
+
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    if external {
+        lifetime.managed = Some(
+            manager_integration::ManagedRuntime::start_external(args.manager_config.as_deref().unwrap(), Path::new(&args.download_dir))
+                .await?,
+        );
+    }
 
     // Init logger
     #[cfg(feature = "manager-integration")]

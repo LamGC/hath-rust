@@ -34,10 +34,73 @@ pub(crate) struct ManagedRuntime {
     degraded: Option<DegradedReporter>,
     // Retained even in degraded mode. Two clients must not touch one profile if
     // one of them cannot acquire/open the outbox.
-    _profile: File,
+    _profile: Option<File>,
+    _external: Option<Arc<File>>,
 }
 
 impl ManagedRuntime {
+    pub(crate) async fn is_external(path: &Path) -> io::Result<bool> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let value: serde_json::Value = super::protocol::decode(&read_private(&path, 64 * 1024)?).map_err(invalid)?;
+            match value.get("mode") {
+                None => Ok(false),
+                Some(mode) if mode == "external" => Ok(true),
+                _ => Err(invalid("manager_mode_invalid")),
+            }
+        })
+        .await
+        .map_err(|_| invalid("manager_startup_worker"))?
+    }
+
+    pub(crate) async fn start_external(path: &Path, downloads: &Path) -> io::Result<Self> {
+        let path = path.to_owned();
+        let downloads = downloads.to_owned();
+        let (settings, identity, fence, registry) = tokio::task::spawn_blocking(move || {
+            let settings = super::external::Settings::read(&path)?;
+            if std::path::absolute(&downloads)? != settings.download_root {
+                return Err(invalid("manager_download_root_mismatch"));
+            }
+            let identity = super::identity()?;
+            let fence = super::external::Registry::lock(&settings)?;
+            let registry = super::external::Registry::start_locked(&settings, &identity, fence.clone());
+            if let Err(error) = &registry
+                && matches!(error.to_string().as_str(), "manager_external_binding_changed" | "manager_external_binding_missing")
+            {
+                return Err(invalid("manager_external_binding_changed"));
+            }
+            Ok((settings, identity, fence, registry))
+        })
+        .await
+        .map_err(|_| invalid("manager_startup_worker"))??;
+        let mut owner = Self {
+            observations: ObservationHandle::new(),
+            sampler: None,
+            snapshot_millis: settings.snapshot_millis,
+            handle: IntegrationHandle::unavailable(),
+            runtime: None,
+            degraded: None,
+            _profile: None,
+            _external: Some(fence),
+        };
+        if let Ok(registry) = registry {
+            let source = registry.recovery_source(&settings);
+            match Runtime::start_external(registry.config.clone(), identity.clone(), registry.history, source).await {
+                Ok(runtime) => {
+                    owner.handle = runtime.handle();
+                    owner.runtime = Some(runtime);
+                }
+                Err(error) if error.to_string() == "manager_spool_busy" => return Err(error),
+                Err(_) => {
+                    owner.degraded = DegradedReporter::start(registry.config, identity).await.ok();
+                }
+            }
+        }
+        // No official ClientKey is read or written here. Registry/storage failure
+        // pauses Gallery but keeps H@H's own credential and cache lifecycle intact.
+        Ok(owner)
+    }
+
     pub(crate) async fn start(path: &Path, data: &Path) -> io::Result<(Self, (i32, String))> {
         let path = path.to_owned();
         let data = data.to_owned();
@@ -88,7 +151,8 @@ impl ManagedRuntime {
                     handle: runtime.handle(),
                     runtime: Some(runtime),
                     degraded: None,
-                    _profile: profile,
+                    _profile: Some(profile),
+                    _external: None,
                 },
                 credentials,
             )),
@@ -103,7 +167,8 @@ impl ManagedRuntime {
                         handle: IntegrationHandle::unavailable(),
                         runtime: None,
                         degraded: Some(degraded),
-                        _profile: profile,
+                        _profile: Some(profile),
+                        _external: None,
                     },
                     credentials,
                 ))
@@ -133,7 +198,7 @@ impl ManagedRuntime {
         }
     }
     pub(crate) fn is_degraded(&self) -> bool {
-        self.degraded.is_some()
+        self.runtime.is_none()
     }
     pub(crate) fn upstream_ready(&self) {
         self.handle.upstream_ready();
@@ -315,6 +380,37 @@ mod tests {
             config,
             spool,
         }
+    }
+
+    #[tokio::test]
+    async fn external_registry_failure_keeps_fence_without_reading_or_writing_official_credentials() {
+        let f = fixture("https://127.0.0.1:1/");
+        let downloads = f._root.path().join("downloads");
+        let settings = json!({"mode":"external","identityId":"owner-test","rpcUrl":"https://127.0.0.1:1/",
+            "credentialFile":f._root.path().join("absent-token"),"spoolDirectory":f.spool,"downloadRoot":downloads});
+        std::fs::write(&f.config, serde_json::to_vec(&settings).unwrap()).unwrap();
+        std::fs::remove_file(f.data.join("client_login")).unwrap();
+        let binding = f.spool.join("binding.json");
+        std::fs::write(&binding, b"corrupt-test-state").unwrap();
+        std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(ManagedRuntime::is_external(&f.config).await.unwrap());
+        let owner = ManagedRuntime::start_external(&f.config, &downloads).await.unwrap();
+        assert!(owner.is_degraded());
+        assert!(owner.handle().enabled());
+        assert!(!owner.handle().health().unwrap().persistence_healthy);
+        assert_eq!(
+            ManagedRuntime::start_external(&f.config, &downloads)
+                .await
+                .err()
+                .unwrap()
+                .to_string(),
+            "manager_external_profile_busy"
+        );
+        assert!(!f.data.join("client_login").exists());
+        assert_eq!(std::fs::read(&binding).unwrap(), b"corrupt-test-state");
+        owner.shutdown().await.unwrap();
+        let directory = File::open(&f.spool).unwrap();
+        rustix::fs::flock(&directory, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
     }
     async fn manager() -> (String, mpsc::Receiver<Value>, CancellationToken, JoinHandle<()>) {
         async fn registration() -> String {

@@ -34,6 +34,7 @@ enum Mode {
     Degraded,
     BadCertificate,
     RejectedStart,
+    External,
 }
 struct ChildGuard(Child);
 impl Drop for ChildGuard {
@@ -51,6 +52,8 @@ struct Mock {
     observations: mpsc::Sender<Value>,
     started: Notify,
     release_start: Notify,
+    registrations: Mutex<Vec<Value>>,
+    completed: Mutex<Vec<Value>>,
 }
 fn sha(bytes: &[u8]) -> String {
     const_hex::encode(digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, bytes))
@@ -173,7 +176,11 @@ async fn control(State(mock): State<Arc<Mock>>, uri: Uri) -> Response<Body> {
 async fn manager(State(mock): State<Arc<Mock>>, uri: Uri, bytes: Bytes) -> String {
     mock.actions.lock().unwrap().push(format!("manager:{}", uri.path()));
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["instanceId"], INSTANCE);
+    if mock.mode == Mode::External {
+        assert_eq!(body["instanceId"].as_str().unwrap().len(), 36);
+    } else {
+        assert_eq!(body["instanceId"], INSTANCE);
+    }
     match uri.path() {
         "/rpc/v1/agents/register" => {
             let mut capabilities = vec![
@@ -186,12 +193,27 @@ async fn manager(State(mock): State<Arc<Mock>>, uri: Uri, bytes: Bytes) -> Strin
             if mock.mode != Mode::NoTelemetry {
                 capabilities.push("telemetry.v1");
             }
-            json!({"status":"registered","serverTime":chrono::Utc::now(),"managerProtocol":{"major":1,"minor":0},
-            "selectedProtocol":{"major":1,"minor":0},"enabledCapabilities":capabilities,
+            let minor = if mock.mode == Mode::External {
+                capabilities.push("external.session.v1");
+                assert_eq!(body["externalIdentity"]["identityId"], "external-test");
+                assert!(matches!(body["externalIdentity"]["purpose"].as_str(), Some("live" | "replay")));
+                mock.registrations.lock().unwrap().push(body.clone());
+                assert_eq!(body["protocol"]["minor"], 1);
+                1
+            } else {
+                0
+            };
+            json!({"status":"registered","serverTime":chrono::Utc::now(),"managerProtocol":{"major":1,"minor":minor},
+            "selectedProtocol":{"major":1,"minor":minor},"enabledCapabilities":capabilities,
             "outputProfile":"gallery-v2","sessionId":"0123456789abcdef0123456789abcdef","legacy":false})
             .to_string()
         }
         "/rpc/v1/events/batch" => {
+            for event in body["events"].as_array().unwrap() {
+                if event["eventType"] == "gallery.download.completed" {
+                    mock.completed.lock().unwrap().push(event.clone());
+                }
+            }
             mock.observations.send(body.clone()).await.unwrap();
             json!({"ok":true,"batchId":body["batchId"]}).to_string()
         }
@@ -258,6 +280,8 @@ async fn scenario(mode: Mode) {
         observations: tx,
         started: Notify::new(),
         release_start: Notify::new(),
+        registrations: Mutex::new(Vec::new()),
+        completed: Mutex::new(Vec::new()),
     });
     let stop = CancellationToken::new();
     let router = Router::new()
@@ -292,9 +316,20 @@ async fn scenario(mode: Mode) {
         std::fs::write(&path, bytes).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
+    if mode == Mode::External {
+        let settings = json!({"mode":"external","identityId":"external-test","rpcUrl":endpoint,
+            "credentialFile":root.path().join("token"),"spoolDirectory":spool,"downloadRoot":root.path().join("download"),
+            "allowPrivateHttp":true,"heartbeatMillis":1000,"snapshotMillis":1000});
+        std::fs::write(root.path().join("runtime.json"), serde_json::to_vec(&settings).unwrap()).unwrap();
+        std::fs::set_permissions(root.path().join("data"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(root.path().join("data/client_login"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_hath-rust"));
+    command.env_remove("HATH_MANAGER_CONFIG");
     command.current_dir(root.path());
-    if mode != Mode::Standalone {
+    if mode == Mode::External {
+        command.env("HATH_MANAGER_CONFIG", root.path().join("runtime.json"));
+    } else if mode != Mode::Standalone {
         command.arg("--manager-config").arg(root.path().join("runtime.json"));
     } else {
         std::fs::write(root.path().join("token"), "invalid-unused-credential").unwrap();
@@ -358,7 +393,7 @@ async fn scenario(mode: Mode) {
                 sha(format!("hentai@home-servercmd-start_downloader-none-1001-{time}-{KEY}").as_bytes())
             );
             assert_eq!(http.get(url).send().await.unwrap().status(), StatusCode::OK);
-            if mode == Mode::Normal || mode == Mode::NoTelemetry {
+            if mode == Mode::Normal || mode == Mode::NoTelemetry || mode == Mode::External {
                 let terminal = timeout(Duration::from_secs(10), async {
                     loop {
                         let body = rx.recv().await.unwrap();
@@ -450,6 +485,17 @@ async fn scenario(mode: Mode) {
                 assert_eq!(std::fs::read_dir(root.path().join("download")).unwrap().count(), 0);
                 assert!(!mock.actions.lock().unwrap().iter().any(|act| act == "dlfetch"));
             }
+            if mode == Mode::External {
+                assert_eq!(std::fs::read_to_string(root.path().join("data/client_login")).unwrap(), format!("1001-{KEY}"));
+                assert_eq!(
+                    std::fs::metadata(root.path().join("data/client_login"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o640
+                );
+            }
             assert!(signal_and_wait(&mut child).await.success());
             assert_eq!(
                 mock.actions
@@ -460,6 +506,64 @@ async fn scenario(mode: Mode) {
                     .count(),
                 1
             );
+            if mode == Mode::External {
+                let original = mock.completed.lock().unwrap()[0].clone();
+                let first_boot = mock.registrations.lock().unwrap()[0].clone();
+                assert_eq!(first_boot["externalIdentity"]["runGeneration"], 1);
+                assert_eq!(first_boot["externalIdentity"]["purpose"], "live");
+                while rx.try_recv().is_ok() {}
+                child = ChildGuard(command.spawn().unwrap());
+                timeout(Duration::from_secs(10), mock.started.notified()).await.unwrap();
+                mock.release_start.notify_one();
+                timeout(Duration::from_secs(10), async {
+                    loop {
+                        if mock.completed.lock().unwrap().len() >= 2 {
+                            break;
+                        }
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let registrations = mock.registrations.lock().unwrap().clone();
+                let live = registrations
+                    .iter()
+                    .find(|value| value["externalIdentity"]["runGeneration"] == 2)
+                    .unwrap();
+                assert_eq!(live["externalIdentity"]["purpose"], "live");
+                assert_ne!(live["instanceId"], first_boot["instanceId"]);
+                let historical = registrations
+                    .iter()
+                    .find(|value| value["externalIdentity"]["purpose"] == "replay")
+                    .unwrap();
+                let mut expected = first_boot;
+                expected["externalIdentity"]["purpose"] = "replay".into();
+                assert_eq!(historical, &expected);
+                assert_eq!(mock.completed.lock().unwrap()[1], original);
+                next_health(&mut rx, true, true).await;
+                manager_task.abort();
+                exercise_image_http(&http, port, root.path()).await;
+                assert!(child.0.try_wait().unwrap().is_none());
+                assert_eq!(
+                    mock.actions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|act| act.as_str() == "client_stop")
+                        .count(),
+                    1
+                );
+                assert!(signal_and_wait(&mut child).await.success());
+                assert_eq!(
+                    mock.actions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|act| act.as_str() == "client_stop")
+                        .count(),
+                    2
+                );
+            }
         }
     }
     for name in ["data", "spool"] {
@@ -471,7 +575,10 @@ async fn scenario(mode: Mode) {
     }
     stop.cancel();
     control_task.await.unwrap();
-    manager_task.await.unwrap();
+    match manager_task.await {
+        Err(error) if mode == Mode::External && error.is_cancelled() => (),
+        result => result.unwrap(),
+    }
     if mode == Mode::Normal {
         for name in ["log/log_out", "log/log_err"] {
             let text = std::fs::read_to_string(root.path().join(name)).unwrap();
@@ -550,6 +657,10 @@ async fn wait_for_telemetry(rx: &mut mpsc::Receiver<Value>) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_normal_start_gallery_handoff_and_shutdown() {
     scenario(Mode::Normal).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_cli_external_uses_env_and_original_credentials_and_survives_node_loss() {
+    scenario(Mode::External).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_cli_without_manager_config_stays_noop_and_preserves_upstream_layout() {

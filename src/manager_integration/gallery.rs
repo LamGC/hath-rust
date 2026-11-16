@@ -15,7 +15,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{self, Read, Write},
-    os::unix::fs::MetadataExt,
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -427,7 +427,8 @@ fn prepare_terminal_inner(
         directory.replace(JOURNAL, &encode(&journal, 64 * 1024)?)?;
         checkpoint(Milestone::PreparedWritten)?;
     }
-    let event = recover_commit(&directory, &mut journal, checkpoint)?.ok_or_else(|| invalid("gallery_terminal_missing"))?;
+    let event = recover_commit(&directory, &mut journal, &RecoveryIdentity::current(), checkpoint)?
+        .ok_or_else(|| invalid("gallery_terminal_missing"))?;
     if (event.event_type == "gallery.download.completed") != success {
         return Err(invalid("gallery_terminal_conflict"));
     }
@@ -442,9 +443,177 @@ pub(super) fn recover_ready(directory: &Path, expected_instance: &str) -> io::Re
 
 // Caller owns the spool-root writer lock and has fenced the original process. No network/runtime is created.
 pub(super) fn recover_handoff(directory: &Path, expected_instance: &str) -> io::Result<(Event, Option<Event>)> {
+    recover_handoff_identity(directory, expected_instance, &RecoveryIdentity::current())
+}
+
+struct RecoveryIdentity<'a> {
+    client_version: &'a str,
+    agent_version: &'a str,
+    adapter_id: &'a str,
+}
+impl RecoveryIdentity<'_> {
+    fn current() -> Self {
+        Self {
+            client_version: env!("CARGO_PKG_VERSION"),
+            agent_version: INTEGRATION_VERSION,
+            adapter_id: ADAPTER_ID,
+        }
+    }
+}
+
+impl<'a> RecoveryIdentity<'a> {
+    fn original(boot: &'a super::external::Boot) -> io::Result<Self> {
+        let value = &boot.registration;
+        let text = |key: &str| {
+            value[key]
+                .as_str()
+                .filter(|text| !text.is_empty() && text.len() <= 128)
+                .ok_or_else(|| invalid("gallery_recovery_identity"))
+        };
+        Ok(Self {
+            client_version: text("hathVersion")?,
+            agent_version: text("agentVersion")?,
+            adapter_id: text("adapterId")?,
+        })
+    }
+}
+
+// The External owner fences all earlier boots. The registered source version,
+// not this newly installed binary's Cargo version, authenticates old metadata.
+pub(super) fn recover_external_handoff(directory: &Path, boot: &super::external::Boot) -> io::Result<(Event, Option<Event>)> {
+    let identity = RecoveryIdentity::original(boot)?;
+    recover_handoff_identity(directory, &boot.instance_id, &identity)
+}
+
+// A fenced prior process cannot resume an unfinished attempt. Record an explicit
+// failure decision; a staged success document alone never authorizes success.
+pub(super) fn recover_external_attempt(directory: &Path, boot: &super::external::Boot) -> io::Result<Vec<Event>> {
+    let identity = RecoveryIdentity::original(boot)?;
+    let directory = Directory::open(directory)?;
+    let mut journal = load_journal(&directory, &boot.instance_id)?;
+    if journal.terminal.is_none() {
+        if directory.read_optional(METADATA, MAX_METADATA)?.is_some() {
+            return Err(invalid("gallery_terminal_missing"));
+        }
+        let payload = &journal.initialized.payload;
+        let text = |key: &str| payload[key].as_str().ok_or_else(|| invalid("gallery_journal_identity"));
+        let gid = payload["gid"]
+            .as_i64()
+            .and_then(|gid| i32::try_from(gid).ok())
+            .filter(|gid| *gid > 0)
+            .ok_or_else(|| invalid("gallery_journal_identity"))?;
+        let metadata = Metadata {
+            schema_version: 2,
+            job_key: text("jobKey")?.into(),
+            status: "failed".into(),
+            gid,
+            gallery_token: None,
+            min_x_res: text("minXRes")?.into(),
+            title: text("title")?.into(),
+            information: String::new(),
+            hath: Hath {
+                client_version: identity.client_version.into(),
+                client_build: None,
+                jar_sha256: None,
+            },
+            agent: Agent {
+                version: identity.agent_version.into(),
+                adapter_id: identity.adapter_id.into(),
+            },
+            download: Download {
+                directory: journal.directory.clone(),
+                completed_at: chrono::Utc::now(),
+            },
+            files: Vec::new(),
+            download_attempt_id: journal.attempt_id.clone(),
+        };
+        let bytes = encode(&metadata, MAX_METADATA)?;
+        directory.replace(PENDING, &bytes)?;
+        let mut terminal = journal.terminal_seed.clone();
+        terminal.event_type = "gallery.download.failed".into();
+        terminal.occurred_at = metadata.download.completed_at;
+        terminal.payload = journal.initialized.payload.clone();
+        terminal.payload["success"] = false.into();
+        terminal.payload["metadataPath"] = json!(directory.path.join(METADATA));
+        terminal.payload["metadataSha256"] = sha256(&bytes).into();
+        terminal.encode()?;
+        journal.terminal = Some(Terminal {
+            ready: false,
+            metadata_sha256: sha256(&bytes),
+            event: terminal,
+        });
+        directory.replace(JOURNAL, &encode(&journal, 64 * 1024)?)?;
+    }
+    let terminal =
+        recover_commit(&directory, &mut journal, &identity, &mut |_| Ok(()))?.ok_or_else(|| invalid("gallery_terminal_missing"))?;
+    Ok(vec![journal.initialized, terminal])
+}
+
+// Bounded discovery only, never hashes images. Called off the executor before
+// new Gallery attempts are admitted; unrelated standalone directories are ignored.
+pub(super) fn discover_external_handoffs(root: &Path, boots: &[super::external::Boot]) -> io::Result<Vec<(usize, PathBuf)>> {
+    let directory = match open_no_follow(root) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    validate_dir(&directory, false)?;
+    let mut found = Vec::new();
+    let mut visited = 0;
+    for group in std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+        let group = group?;
+        visited += 1;
+        if visited > 16_384 {
+            return Err(invalid("gallery_recovery_capacity"));
+        }
+        if !group.file_type()?.is_dir() {
+            continue;
+        }
+        let group_path = root.join(group.file_name());
+        let group_fd = open_no_follow(&group_path)?;
+        validate_dir(&group_fd, false)?;
+        for attempt in std::fs::read_dir(format!("/proc/self/fd/{}", group_fd.as_raw_fd()))? {
+            let attempt = attempt?;
+            visited += 1;
+            if visited > 16_384 || found.len() >= 4096 {
+                return Err(invalid("gallery_recovery_capacity"));
+            }
+            if !attempt.file_type()?.is_dir() {
+                continue;
+            }
+            let name = attempt.file_name();
+            if !name
+                .to_str()
+                .and_then(|name| name.strip_prefix("attempt-"))
+                .is_some_and(canonical_id)
+            {
+                continue;
+            }
+            let path = group_path.join(&name);
+            let candidate = Directory::open(&path)?;
+            let Some(bytes) = candidate.read_optional(JOURNAL, 64 * 1024)? else {
+                continue;
+            };
+            let journal: Journal = protocol::decode(&bytes).map_err(invalid)?;
+            let index = boots
+                .iter()
+                .position(|boot| boot.instance_id == journal.instance_id)
+                .ok_or_else(|| invalid("gallery_recovery_boot_missing"))?;
+            load_journal(&candidate, &boots[index].instance_id)?;
+            found.push((index, path));
+        }
+    }
+    Ok(found)
+}
+
+fn recover_handoff_identity(
+    directory: &Path,
+    expected_instance: &str,
+    identity: &RecoveryIdentity<'_>,
+) -> io::Result<(Event, Option<Event>)> {
     let directory = Directory::open(directory)?;
     let mut journal = load_journal(&directory, expected_instance)?;
-    let terminal = recover_commit(&directory, &mut journal, &mut |_| Ok(()))?;
+    let terminal = recover_commit(&directory, &mut journal, identity, &mut |_| Ok(()))?;
     Ok((journal.initialized, terminal))
 }
 
@@ -477,6 +646,7 @@ fn load_journal(directory: &Directory, expected_instance: &str) -> io::Result<Jo
 fn recover_commit(
     directory: &Directory,
     journal: &mut Journal,
+    identity: &RecoveryIdentity<'_>,
     checkpoint: &mut impl FnMut(Milestone) -> io::Result<()>,
 ) -> io::Result<Option<Event>> {
     let Some(terminal) = &journal.terminal else {
@@ -516,11 +686,11 @@ fn recover_commit(
         || Some(metadata.min_x_res.as_str()) != journal.initialized.payload["minXRes"].as_str()
         || metadata.gallery_token.is_some()
         || metadata.information.len() > 8192
-        || metadata.hath.client_version != env!("CARGO_PKG_VERSION")
+        || metadata.hath.client_version != identity.client_version
         || metadata.hath.client_build.is_some()
         || metadata.hath.jar_sha256.is_some()
-        || metadata.agent.version != INTEGRATION_VERSION
-        || metadata.agent.adapter_id != ADAPTER_ID
+        || metadata.agent.version != identity.agent_version
+        || metadata.agent.adapter_id != identity.adapter_id
         || success && (metadata.files.is_empty() || Some(metadata.files.len() as u64) != journal.initialized.payload["fileCount"].as_u64())
         || !success && !metadata.files.is_empty()
         || metadata.files.len() > 10000
@@ -792,6 +962,7 @@ mod tests {
         let fixture: Value = serde_json::from_str(include_str!("fixtures/agent-registration-native-v1.json")).unwrap();
         let identity: NativeIdentity = serde_json::from_value(fixture["nativeIdentity"].clone()).unwrap();
         let config = Config {
+            external: None,
             instance_id: "11111111-1111-4111-8111-111111111111".into(),
             stable_instance_key: "primary".into(),
             rpc_url: format!("http://{}/", listener.local_addr().unwrap()),
@@ -850,6 +1021,85 @@ mod tests {
         let events = outbox.batch().unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.iter().any(|item| item.event == event));
+    }
+
+    #[tokio::test]
+    async fn external_recovery_uses_original_boot_version_and_preserves_uncommitted_decision() {
+        let root = tempfile::tempdir().unwrap();
+        let (runtime, _listener, _) = runtime(root.path()).await;
+        let mut attempt = runtime
+            .handle()
+            .prepare_gallery(&root.path().join("gallery"), &TestGallery)
+            .unwrap()
+            .unwrap();
+        attempt.initialize().await.unwrap();
+        images(&attempt);
+        attempt.finish(true, receipts()).await.unwrap();
+        let dir = Directory::open(attempt.directory()).unwrap();
+        let mut metadata: Value = serde_json::from_slice(&dir.read(METADATA, MAX_METADATA).unwrap()).unwrap();
+        // Model a handoff produced before an upgrade, including its original digest.
+        metadata["hath"]["clientVersion"] = "1.18.0".into();
+        let original = serde_json::to_vec(&metadata).unwrap();
+        dir.replace(METADATA, &original).unwrap();
+        let mut journal = load_journal(&dir, &attempt.journal.instance_id).unwrap();
+        let terminal = journal.terminal.as_mut().unwrap();
+        terminal.metadata_sha256 = sha256(&original);
+        terminal.event.payload["metadataSha256"] = sha256(&original).into();
+        dir.replace(JOURNAL, &encode(&journal, 64 * 1024).unwrap()).unwrap();
+        let mut registration: Value = serde_json::from_str(include_str!("fixtures/agent-registration-external-rust-v1.json")).unwrap();
+        registration["hathVersion"] = "1.18.0".into();
+        registration["nativeIdentity"]["implementationVersion"] = "1.18.0".into();
+        registration["instanceId"] = attempt.journal.instance_id.clone().into();
+        let boot = super::super::external::Boot {
+            schema_version: 1,
+            generation: 1,
+            instance_id: attempt.journal.instance_id.clone(),
+            registration,
+        };
+        assert!(recover_handoff(attempt.directory(), &boot.instance_id).is_err());
+        let (initialized, recovered) = recover_external_handoff(attempt.directory(), &boot).unwrap();
+        assert!(initialized == journal.initialized);
+        assert!(recovered.unwrap() == journal.terminal.as_ref().unwrap().event);
+        assert_eq!(dir.read(METADATA, MAX_METADATA).unwrap(), original);
+        let mut wrong = boot.clone();
+        wrong.registration["agentVersion"] = "0.0.0".into();
+        assert!(recover_external_handoff(attempt.directory(), &wrong).is_err());
+        let mut pending = runtime
+            .handle()
+            .prepare_gallery(&root.path().join("gallery"), &TestGallery)
+            .unwrap()
+            .unwrap();
+        pending.initialize().await.unwrap();
+        images(&pending);
+        assert!(
+            prepare_terminal_inner(&pending.journal, &pending.description, true, receipts(), &mut |point| {
+                if point == Milestone::PendingWritten {
+                    Err(invalid("test_interruption"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
+        assert!(recover_external_handoff(pending.directory(), &boot).unwrap().1.is_none());
+        assert!(!pending.directory().join(METADATA).exists());
+        let discovered = discover_external_handoffs(root.path(), std::slice::from_ref(&boot)).unwrap();
+        assert_eq!(discovered.len(), 2);
+        assert!(discovered.iter().all(|(index, _)| *index == 0));
+        let failed = recover_external_attempt(pending.directory(), &boot).unwrap();
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[1].event_type, "gallery.download.failed");
+        assert_eq!(failed[1].payload["success"], false);
+        let failed_bytes = std::fs::read(pending.directory().join(METADATA)).unwrap();
+        let failed_metadata: Value = serde_json::from_slice(&failed_bytes).unwrap();
+        assert_eq!(failed_metadata["status"], "failed");
+        assert_eq!(failed_metadata["files"], json!([]));
+        assert_eq!(failed_metadata["hath"]["clientVersion"], "1.18.0");
+        assert!(pending.directory().join("001.jpg").is_file());
+        let retried = recover_external_attempt(pending.directory(), &boot).unwrap();
+        assert!(retried == failed);
+        assert_eq!(std::fs::read(pending.directory().join(METADATA)).unwrap(), failed_bytes);
+        runtime.shutdown().await.unwrap();
     }
 
     #[tokio::test]

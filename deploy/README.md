@@ -3,9 +3,10 @@
 本示例没有 `--manager-config`，不会连接 hath-manager，也不需要 man-agent。
 缓存、身份、下载和日志全部放在挂载的 `/hath`，重建容器不会重新创建身份。
 
-**首次发布前，不能假设 GHCR 已有镜像。** 获取确认发布的
-不可变 `dev-<完整提交 SHA>` 标签或镜像 digest 后，再设置下方 `HATH_IMAGE`。
+已发布的 `1.19.2` 提供 linux/amd64 和 linux/arm64 标准镜像，可用于本页的独立部署。
 正式版本仅在管理员手动发布对应 Release 后发布；开发镜像不冒充正式版本。
+`1.20.0` 开始提供 External 接入；发布草稿及正式容器构建完成前，请勿假定该镜像已经可拉取。
+External 不包含在 `1.19.2` 中，不要给旧版本配置该模式。
 
 ## 1. 数据和身份
 
@@ -27,7 +28,7 @@ ClientKey 为官方发放的 20 位字母数字串。一个有效客户端身份
 把 `compose.standalone.yml` 保存到部署目录，设置：
 
 ```sh
-export HATH_IMAGE='ghcr.io/lamgc/hath-rust:dev-替换为已发布的完整提交SHA'
+export HATH_IMAGE='ghcr.io/lamgc/hath-rust:1.19.2'
 export HATH_PORT=8080
 docker compose -f compose.standalone.yml config --quiet
 docker compose -f compose.standalone.yml up -d
@@ -39,7 +40,8 @@ docker compose -f compose.standalone.yml logs --tail 100 -f
 确认客户端已被官方控制服务器接纳后再长期运行；本项目的离线测试不代替官方注册/网络检查。
 
 停止使用 `docker compose -f compose.standalone.yml down`，不删除数据目录。
-后续 External 接入会另行提供配置；目前不要为了接入 Manager 把同一数据目录交给另一个 Managed 实例启动。
+`1.20.0` 的 External 配置与独立 man-agent 部署示例在配套 hath-manager 仓库的 `deploy/containers/`；
+本页继续只说明已发布的独立运行版。不要为了接入 Manager 把同一数据目录交给另一个 Managed 实例启动。
 
 ## 本地构建
 

@@ -49,12 +49,13 @@ struct State {
     phase: AtomicU8,
     link_healthy: AtomicBool,
     persistence_healthy: AtomicBool,
+    recovery_ready: AtomicBool,
     quarantined: AtomicUsize,
     outbox_depth: AtomicUsize,
     outbox_bytes: AtomicU64,
     write_failures: AtomicU64,
     telemetry_failures: AtomicU64,
-    wake: Notify,
+    wake: Arc<Notify>,
     snapshot: watch::Sender<Option<Arc<Snapshot>>>,
 }
 struct PersistenceHealth(Arc<State>);
@@ -75,7 +76,9 @@ impl State {
             health_sequence: sequence,
             observed_at: chrono::Utc::now(),
             integration_ready: true,
-            persistence_healthy: self.persistence_healthy.load(Relaxed) && self.quarantined.load(Relaxed) == 0,
+            persistence_healthy: self.persistence_healthy.load(Relaxed)
+                && self.quarantined.load(Relaxed) == 0
+                && self.recovery_ready.load(Relaxed),
             client_ready: self.phase.load(Relaxed) == Phase::Active as u8,
         })
     }
@@ -85,7 +88,7 @@ impl State {
             .map_err(|_| invalid("manager_sequence_exhausted"))
     }
     fn status(&self) -> &'static str {
-        if !self.persistence_healthy.load(Relaxed) || self.quarantined.load(Relaxed) != 0 {
+        if !self.persistence_healthy.load(Relaxed) || self.quarantined.load(Relaxed) != 0 || !self.recovery_ready.load(Relaxed) {
             "degraded"
         } else {
             match self.phase.load(Relaxed) {
@@ -159,7 +162,7 @@ impl IntegrationHandle {
         }
         self.inner.as_ref().map(|enabled| Health {
             link_healthy: enabled.state.link_healthy.load(Relaxed),
-            persistence_healthy: enabled.state.persistence_healthy.load(Relaxed),
+            persistence_healthy: enabled.state.persistence_healthy.load(Relaxed) && enabled.state.recovery_ready.load(Relaxed),
             quarantined: enabled.state.quarantined.load(Relaxed),
             outbox_depth: enabled.state.outbox_depth.load(Relaxed),
         })
@@ -185,6 +188,13 @@ impl IntegrationHandle {
     // The future Gallery façade owns event creation/journaling, so retry uses the same Event.
     pub(super) fn event(&self, kind: &str, payload: Value) -> io::Result<Option<Event>> {
         self.ensure_available()?;
+        if self
+            .inner
+            .as_ref()
+            .is_some_and(|enabled| !enabled.state.recovery_ready.load(Relaxed))
+        {
+            return Err(invalid("manager_recovery_pending"));
+        }
         self.inner
             .as_ref()
             .map(|enabled| Event::new(&enabled.state.instance, enabled.state.sequence()?, kind, payload))
@@ -255,6 +265,40 @@ impl Runtime {
     }
 
     pub(super) async fn start_with_limits(config: Config, identity: NativeIdentity, limits: Limits) -> io::Result<Self> {
+        Self::start_with_history(config, identity, limits, Vec::new()).await
+    }
+
+    pub(super) async fn start_with_history(
+        config: Config,
+        identity: NativeIdentity,
+        limits: Limits,
+        history: Vec<super::external::Boot>,
+    ) -> io::Result<Self> {
+        Self::start_inner(config, identity, limits, history, None).await
+    }
+
+    pub(super) async fn start_external(
+        config: Config,
+        identity: NativeIdentity,
+        history: Vec<super::external::Boot>,
+        source: super::external::RecoverySource,
+    ) -> io::Result<Self> {
+        Self::start_inner(config, identity, Limits::default(), history, Some(source)).await
+    }
+
+    async fn start_inner(
+        config: Config,
+        identity: NativeIdentity,
+        limits: Limits,
+        history: Vec<super::external::Boot>,
+        source: Option<super::external::RecoverySource>,
+    ) -> io::Result<Self> {
+        if !history.is_empty() && config.external.is_none() {
+            return Err(invalid("manager_external_required"));
+        }
+        let boots = Arc::new(history);
+        let (ready, updates) = mpsc::channel(64);
+        let replay = Replay::new(config.clone(), boots.clone(), updates);
         let (snapshot, receiver) = watch::channel(None);
         let state = Arc::new(State {
             instance: config.instance_id.clone(),
@@ -264,12 +308,13 @@ impl Runtime {
             phase: AtomicU8::new(Phase::Starting as u8),
             link_healthy: AtomicBool::new(false),
             persistence_healthy: AtomicBool::new(false),
+            recovery_ready: AtomicBool::new(source.is_none()),
             quarantined: AtomicUsize::new(0),
             outbox_depth: AtomicUsize::new(0),
             outbox_bytes: AtomicU64::new(0),
             write_failures: AtomicU64::new(0),
             telemetry_failures: AtomicU64::new(0),
-            wake: Notify::new(),
+            wake: Arc::new(Notify::new()),
             snapshot,
         });
         // native.health.v1 is required even when telemetry.v1 was not negotiated.
@@ -289,8 +334,24 @@ impl Runtime {
             unavailable: false,
         };
         let (stop, cancellation) = watch::channel(false);
+        let recovery = source.map(|source| {
+            let state = state.clone();
+            let storage = storage.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                let result = super::recovery::run(source, boots, storage, ready, state.wake.clone(), cancellation.clone()).await;
+                if result.is_ok() && !*cancellation.borrow() {
+                    state.recovery_ready.store(true, Relaxed);
+                    state.health_dirty.store(true, Relaxed);
+                    state.wake.notify_one();
+                }
+            })
+        });
         let sender = tokio::spawn(async move {
-            run(transport, &storage, &state, &identity, receiver, cancellation, heartbeat, snapshot).await;
+            run(transport, &storage, &state, &identity, receiver, cancellation, heartbeat, snapshot, replay).await;
+            if let Some(recovery) = recovery {
+                let _ = recovery.await;
+            }
             storage.close().await
         });
         Ok(Self {
@@ -337,11 +398,14 @@ enum Command {
     },
     Batch(oneshot::Sender<io::Result<Vec<Record>>>),
     Ack(Vec<Record>, oneshot::Sender<io::Result<()>>),
+    HistoricalBatch(String, oneshot::Sender<io::Result<Vec<Record>>>),
+    HistoricalAck(Vec<Record>, oneshot::Sender<io::Result<()>>),
+    HistoricalPersist(Vec<Event>, oneshot::Sender<io::Result<()>>),
     Refresh(oneshot::Sender<io::Result<()>>),
     Stop(oneshot::Sender<()>),
 }
 #[derive(Clone)]
-struct Storage {
+pub(super) struct Storage {
     sender: mpsc::Sender<Command>,
     budget: Arc<Semaphore>,
     records: Arc<Semaphore>,
@@ -428,6 +492,28 @@ impl Storage {
                         }
                         let _ = reply.send(result.map_err(|_| invalid("manager_spool_budget")));
                     }
+                    Command::HistoricalBatch(instance, reply) => {
+                        let result = spool.historical_batch(&instance);
+                        if result.is_err() {
+                            state.persistence_healthy.store(false, Relaxed);
+                        }
+                        let _ = reply.send(result.map_err(|_| invalid("manager_history_read")));
+                    }
+                    Command::HistoricalAck(records, reply) => {
+                        let result = spool.historical_ack(&records);
+                        if result.is_err() {
+                            state.write_failures.fetch_add(1, Relaxed);
+                            state.persistence_healthy.store(false, Relaxed);
+                        }
+                        let _ = reply.send(result.map_err(|_| invalid("manager_history_ack")));
+                    }
+                    Command::HistoricalPersist(events, reply) => {
+                        let result = spool.historical_append(&events);
+                        if result.is_err() {
+                            state.write_failures.fetch_add(1, Relaxed);
+                        }
+                        let _ = reply.send(result.map_err(|_| invalid("manager_history_append")));
+                    }
                     Command::Stop(reply) => {
                         receiver.close();
                         stopped = Some(reply);
@@ -496,6 +582,21 @@ impl Storage {
         self.enqueue(Command::Refresh(reply))?;
         response.await.map_err(|_| invalid("manager_persistence_stopped"))?
     }
+    async fn historical_batch(&self, instance: &str) -> io::Result<Vec<Record>> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(Command::HistoricalBatch(instance.into(), reply))?;
+        response.await.map_err(|_| invalid("manager_persistence_stopped"))?
+    }
+    async fn historical_ack(&self, records: Vec<Record>) -> io::Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(Command::HistoricalAck(records, reply))?;
+        response.await.map_err(|_| invalid("manager_persistence_stopped"))?
+    }
+    pub(super) async fn historical_persist(&self, events: Vec<Event>) -> io::Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(Command::HistoricalPersist(events, reply))?;
+        response.await.map_err(|_| invalid("manager_persistence_stopped"))?
+    }
     fn enqueue(&self, command: Command) -> io::Result<()> {
         self.sender.try_send(command).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => invalid("manager_persistence_backpressure"),
@@ -521,6 +622,85 @@ impl Backoff {
     }
 }
 
+// At most one historical HTTP client and one bounded batch. Live health and
+// current events run first on every iteration; a rejected historical boot has
+// its own retry delay and cannot stall the live lease or later historical runs.
+struct Replay {
+    config: Config,
+    boots: Arc<Vec<super::external::Boot>>,
+    history: std::collections::VecDeque<usize>,
+    updates: mpsc::Receiver<usize>,
+    transport: Option<Transport>,
+    next: Instant,
+    backoff: Backoff,
+}
+impl Replay {
+    fn new(config: Config, boots: Arc<Vec<super::external::Boot>>, updates: mpsc::Receiver<usize>) -> Self {
+        Self {
+            config,
+            history: (0..boots.len()).collect(),
+            boots,
+            updates,
+            transport: None,
+            next: Instant::now(),
+            backoff: Backoff(1000),
+        }
+    }
+    fn deadline(&self) -> Option<Instant> {
+        (!self.history.is_empty()).then_some(self.next)
+    }
+    async fn tick(&mut self, storage: &Storage) -> bool {
+        while let Ok(index) = self.updates.try_recv() {
+            if index < self.boots.len() && !self.history.contains(&index) {
+                self.history.push_back(index);
+            }
+        }
+        if self.history.is_empty() || Instant::now() < self.next {
+            return false;
+        }
+        let result = self.step(storage).await;
+        match result {
+            Ok(()) => {
+                self.backoff = Backoff(1000);
+                true
+            }
+            Err(_) => {
+                self.history.rotate_left(1);
+                self.transport = None;
+                self.next = Instant::now() + self.backoff.next();
+                false
+            }
+        }
+    }
+    async fn step(&mut self, storage: &Storage) -> io::Result<()> {
+        let boot = &self.boots[*self.history.front().unwrap()];
+        let records = storage.historical_batch(&boot.instance_id).await?;
+        if records.is_empty() {
+            self.history.pop_front();
+            self.transport = None;
+            return Ok(());
+        }
+        if self.transport.is_none() {
+            let mut config = self.config.clone();
+            config.instance_id = boot.instance_id.clone();
+            let external = config.external.as_mut().ok_or_else(|| invalid("manager_external_required"))?;
+            external.identity.run_generation = boot.generation;
+            external.identity.purpose = "replay".into();
+            self.transport = Some(
+                tokio::task::spawn_blocking(move || Transport::new(&config))
+                    .await
+                    .map_err(|_| invalid("manager_transport_worker"))??,
+            );
+        }
+        let transport = self.transport.as_mut().unwrap();
+        if !transport.has_session() {
+            transport.register_replay(boot).await?;
+        }
+        transport.send_events(&records).await?;
+        storage.historical_ack(records).await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     mut transport: Transport,
@@ -531,6 +711,7 @@ async fn run(
     mut stop: watch::Receiver<bool>,
     heartbeat: Duration,
     snapshot: Duration,
+    mut replay: Replay,
 ) {
     let mut heartbeat_at = Instant::now();
     let mut snapshot_at = Instant::now();
@@ -582,14 +763,14 @@ async fn run(
                 refresh_at = Instant::now() + Duration::from_secs(30);
             }
             let records = storage.batch().await?;
-            if records.is_empty() {
-                return Ok(false);
+            let more = !records.is_empty();
+            if more {
+                let result = transport.send_events(&records).await;
+                state.link_healthy.store(result.is_ok(), Relaxed);
+                result?;
+                storage.ack(records).await?;
             }
-            let result = transport.send_events(&records).await;
-            state.link_healthy.store(result.is_ok(), Relaxed);
-            result?;
-            storage.ack(records).await?;
-            Ok::<_, io::Error>(true)
+            Ok::<_, io::Error>(replay.tick(storage).await || more)
         };
         let outcome = tokio::select! {
             biased;
@@ -617,7 +798,7 @@ async fn run(
                     biased;
                     _ = stop.wait_for(|stop| *stop) => break,
                     _ = state.wake.notified() => (),
-                    _ = sleep_until(heartbeat_at.min(snapshot_at).min(refresh_at)) => (),
+                    _ = sleep_until(heartbeat_at.min(snapshot_at).min(refresh_at).min(replay.deadline().unwrap_or(refresh_at))) => (),
                 }
             }
         }
@@ -644,6 +825,7 @@ mod tests {
         std::fs::create_dir(&spool).unwrap();
         std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o700)).unwrap();
         Config {
+            external: None,
             instance_id: "11111111-1111-4111-8111-111111111111".into(),
             stable_instance_key: "primary".into(),
             rpc_url: url,
@@ -656,6 +838,153 @@ mod tests {
     fn identity() -> NativeIdentity {
         let fixture: Value = serde_json::from_str(include_str!("fixtures/agent-registration-native-v1.json")).unwrap();
         serde_json::from_value(fixture["nativeIdentity"].clone()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn external_replays_original_version_after_live_handshake_and_retries_wrong_ack() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (observed, mut observations) = mpsc::channel(32);
+        let server = tokio::spawn(async move {
+            let mut old_batches = 0;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    assert!(header.len() < 16384);
+                    header.push(socket.read_u8().await.unwrap());
+                }
+                let headers = String::from_utf8(header).unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(length < 256 * 1024);
+                let mut bytes = vec![0; length];
+                socket.read_exact(&mut bytes).await.unwrap();
+                let input: Value = serde_json::from_slice(&bytes).unwrap();
+                let path = headers.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
+                let reply = if path.ends_with("register") {
+                    json!({"status":"registered","serverTime":chrono::Utc::now(),"managerProtocol":{"major":1,"minor":1},
+                        "selectedProtocol":{"major":1,"minor":1},"enabledCapabilities":protocol::Offer::external().capabilities,
+                        "outputProfile":"gallery-v2","sessionId":"0123456789abcdef0123456789abcdef","legacy":false})
+                } else if path.ends_with("batch") {
+                    if input["instanceId"] == "11111111-1111-4111-8111-111111111111" {
+                        old_batches += 1;
+                    }
+                    json!({"ok":true,"batchId":if old_batches == 1 && input["instanceId"] == "11111111-1111-4111-8111-111111111111" {
+                        json!("wrong") } else { input["batchId"].clone() }})
+                } else {
+                    json!({"ok":true})
+                }
+                .to_string();
+                socket
+                    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
+                    .await
+                    .unwrap();
+                if observed.send((path, input)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config(root.path(), url);
+        let original_id = config.instance_id.clone();
+        let original_identity = identity();
+        let previous_external = protocol::ExternalIdentity {
+            identity_id: "hath-external".into(),
+            run_generation: 1,
+            purpose: "live".into(),
+        };
+        let boot = super::super::external::Boot {
+            schema_version: 1,
+            instance_id: original_id.clone(),
+            generation: 1,
+            registration: serde_json::to_value(protocol::Registration::external(&original_id, &original_identity, &previous_external))
+                .unwrap(),
+        };
+        let original = Event::new(&original_id, 7, "gallery.download.completed", json!({"gid":123})).unwrap();
+        {
+            let mut spool = Outbox::open(&config.spool_directory, &original_id, Limits::default()).unwrap();
+            spool.append(&original).unwrap();
+        }
+        let live_id = "22222222-2222-4222-8222-222222222222";
+        config.instance_id = live_id.into();
+        config.external = Some(super::super::config::ExternalConnection {
+            identity: protocol::ExternalIdentity {
+                run_generation: 2,
+                ..previous_external
+            },
+            allow_private_http: true,
+            ca_certificate_file: None,
+        });
+        let mut upgraded = original_identity;
+        upgraded.implementation_version = "1.20.0".into();
+        let runtime = Runtime::start_with_history(config.clone(), upgraded, Limits::default(), vec![boot.clone()])
+            .await
+            .unwrap();
+        let handle = runtime.handle();
+        let first = timeout(Duration::from_secs(3), observations.recv()).await.unwrap().unwrap();
+        assert!(first.0.ends_with("register"));
+        assert_eq!(first.1["instanceId"], live_id);
+        assert_eq!(first.1["nativeIdentity"]["implementationVersion"], "1.20.0");
+        let mut replayed = 0;
+        let mut heartbeats = 0;
+        let live_event = handle.event("gallery.download.initialized", json!({"gid":456})).unwrap().unwrap();
+        let mut live_delivered = false;
+        timeout(Duration::from_secs(5), async {
+            while replayed < 2 || heartbeats < 2 || !live_delivered {
+                let (path, body) = observations.recv().await.unwrap();
+                if path.ends_with("register") {
+                    assert_eq!(body, boot.replay_registration());
+                } else if path.ends_with("heartbeat") {
+                    assert_eq!(body["instanceId"], live_id);
+                    heartbeats += 1;
+                } else if path.ends_with("batch") {
+                    if body["instanceId"] == live_id {
+                        assert_eq!(body["events"][0], serde_json::to_value(&live_event).unwrap());
+                        live_delivered = true;
+                    } else {
+                        assert_eq!(body["instanceId"], original_id);
+                        assert_eq!(body["events"][0], serde_json::to_value(&original).unwrap());
+                        replayed += 1;
+                        if replayed == 1 {
+                            handle.persist(&live_event).await.unwrap();
+                        }
+                    }
+                } else {
+                    panic!("unexpected request {path}");
+                }
+            }
+        })
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !handle
+                .inner
+                .as_ref()
+                .unwrap()
+                .storage
+                .historical_batch(&original_id)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(handle.health().unwrap().link_healthy);
+        runtime.shutdown().await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let recovered = Outbox::open(&config.spool_directory, &original_id, Limits::default()).unwrap();
+        assert!(recovered.batch().unwrap().is_empty());
     }
 
     #[tokio::test]

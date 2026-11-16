@@ -15,6 +15,27 @@ pub(super) const REQUIRED: [&str; 5] = [
     "native.health.v1",
 ];
 pub(super) const MAX_RESPONSE: usize = 64 * 1024;
+pub(super) const EXTERNAL_CAPABILITY: &str = "external.session.v1";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct ExternalIdentity {
+    pub identity_id: String,
+    pub run_generation: u64,
+    pub purpose: String,
+}
+
+impl ExternalIdentity {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !super::config::safe_segment(&self.identity_id)
+            || !(1..=9_007_199_254_740_991).contains(&self.run_generation)
+            || !matches!(self.purpose.as_str(), "live" | "replay")
+        {
+            return Err("manager_external_identity_invalid");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -37,7 +58,7 @@ pub(super) struct NativeIdentity {
     pub eh_compatibility_version: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Offer {
     pub major: u16,
@@ -57,6 +78,14 @@ impl Offer {
             output_profile: PROFILE.into(),
         }
     }
+
+    pub fn external() -> Self {
+        let mut offer = Self::native();
+        offer.minor = 1;
+        offer.capabilities.push(EXTERNAL_CAPABILITY.into());
+        offer.required_capabilities.push(EXTERNAL_CAPABILITY.into());
+        offer
+    }
 }
 
 #[derive(Serialize)]
@@ -71,6 +100,8 @@ pub(super) struct Registration<'a> {
     pub peer_kind: &'a str,
     pub native_identity: &'a NativeIdentity,
     pub protocol: Offer,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_identity: Option<&'a ExternalIdentity>,
 }
 
 impl<'a> Registration<'a> {
@@ -85,6 +116,15 @@ impl<'a> Registration<'a> {
             peer_kind: PEER_KIND,
             native_identity: identity,
             protocol: Offer::native(),
+            external_identity: None,
+        }
+    }
+
+    pub fn external(instance_id: &'a str, identity: &'a NativeIdentity, external: &'a ExternalIdentity) -> Self {
+        Self {
+            protocol: Offer::external(),
+            external_identity: Some(external),
+            ..Self::new(instance_id, identity)
         }
     }
 }
@@ -115,20 +155,30 @@ pub(super) struct Session {
 
 impl Acceptance {
     pub fn validate(self) -> Result<Session, &'static str> {
-        let offered = Offer::native();
+        self.validate_for(false)
+    }
+
+    pub fn validate_for(self, external: bool) -> Result<Session, &'static str> {
+        let offered = if external { Offer::external() } else { Offer::native() };
+        self.validate_offer(&offered)
+    }
+
+    pub fn validate_offer(self, offered: &Offer) -> Result<Session, &'static str> {
         let names: HashSet<_> = self.enabled_capabilities.iter().cloned().collect();
         if self.status != "registered"
             || self.legacy
-            || self.manager_protocol.major != 1
-            || self.selected_protocol.major != 1
-            || self.selected_protocol.minor != 0
+            || offered.major != 1
+            || self.manager_protocol.major != offered.major
+            || self.selected_protocol.major != offered.major
+            || self.selected_protocol.minor != offered.minor
+            || self.manager_protocol.minor < self.selected_protocol.minor
             || self.output_profile != PROFILE
             || self.session_id.len() != 32
             || !self.session_id.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
             || self.enabled_capabilities.len() > 64
             || names.len() != self.enabled_capabilities.len()
             || names.iter().any(|name| !offered.capabilities.contains(name))
-            || REQUIRED.iter().any(|name| !names.contains(*name))
+            || offered.required_capabilities.iter().any(|name| !names.contains(name))
         {
             return Err("manager_protocol_rejected");
         }
@@ -231,6 +281,42 @@ impl<'de> Visitor<'de> for JsonSeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_registration_matches_shared_fixture_and_cannot_downgrade() {
+        let expected: Value = serde_json::from_str(include_str!("fixtures/agent-registration-external-rust-v1.json")).unwrap();
+        let identity = serde_json::from_value(expected["nativeIdentity"].clone()).unwrap();
+        let mut external: ExternalIdentity = serde_json::from_value(expected["externalIdentity"].clone()).unwrap();
+        external.validate().unwrap();
+        let registration = Registration::external(expected["instanceId"].as_str().unwrap(), &identity, &external);
+        assert_eq!(serde_json::to_value(registration).unwrap(), expected);
+        external.purpose = "replay".into();
+        let replay = serde_json::to_value(Registration::external(expected["instanceId"].as_str().unwrap(), &identity, &external)).unwrap();
+        assert_eq!(replay["nativeIdentity"], expected["nativeIdentity"]);
+        assert_eq!(replay["externalIdentity"]["purpose"], "replay");
+        let accepted = serde_json::json!({"status":"registered","serverTime":"2026-11-16T00:00:00Z",
+            "managerProtocol":{"major":1,"minor":2},"selectedProtocol":{"major":1,"minor":1},
+            "enabledCapabilities":Offer::external().capabilities,"outputProfile":PROFILE,
+            "sessionId":"0123456789abcdef0123456789abcdef","legacy":false});
+        let check = |value: &Value| {
+            decode::<Acceptance>(&serde_json::to_vec(value).unwrap())
+                .unwrap()
+                .validate_for(true)
+        };
+        assert!(check(&accepted).is_ok());
+        let mut downgraded = accepted.clone();
+        downgraded["selectedProtocol"]["minor"] = 0.into();
+        assert!(check(&downgraded).is_err());
+        let mut absent = accepted.clone();
+        absent["enabledCapabilities"] = serde_json::json!(Offer::native().capabilities);
+        assert!(check(&absent).is_err());
+        let mut inconsistent = accepted.clone();
+        inconsistent["managerProtocol"]["minor"] = 0.into();
+        assert!(check(&inconsistent).is_err());
+        for generation in [0, 9_007_199_254_740_992, u64::MAX] {
+            external.run_generation = generation;
+            assert!(external.validate().is_err());
+        }
+    }
     #[test]
     fn serializer_matches_manager_fixture() {
         let provenance: Value = serde_json::from_str(include_str!("fixtures/provenance.json")).unwrap();

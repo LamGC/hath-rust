@@ -1,0 +1,44 @@
+{
+  "instanceId": "11111111-1111-4111-8111-111111111111",
+  "agentVersion": "1.0.0",
+  "javaVersion": null,
+  "hathVersion": "1.19.2",
+  "hathBuild": null,
+  "adapterId": "hath-rust-native-v1",
+  "peerKind": "rust_native",
+  "nativeIdentity": {
+    "implementationVersion": "1.19.2",
+    "integrationVersion": "1.0.0",
+    "buildCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "target": "x86_64-unknown-linux-gnu",
+    "artifactSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "ehCompatibilityVersion": "1.6.6"
+  },
+  "protocol": {
+    "major": 1,
+    "minor": 1,
+    "capabilities": [
+      "events.reliable.v1",
+      "gallery.lifecycle.v2",
+      "gallery.metadata.v2",
+      "client.native.v1",
+      "native.health.v1",
+      "telemetry.v1",
+      "external.session.v1"
+    ],
+    "requiredCapabilities": [
+      "events.reliable.v1",
+      "gallery.lifecycle.v2",
+      "gallery.metadata.v2",
+      "client.native.v1",
+      "native.health.v1",
+      "external.session.v1"
+    ],
+    "outputProfile": "gallery-v2"
+  },
+  "externalIdentity": {
+    "identityId": "hath-external",
+    "runGeneration": 1,
+    "purpose": "live"
+  }
+}

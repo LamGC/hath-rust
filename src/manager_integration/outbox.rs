@@ -209,6 +209,10 @@ impl Outbox {
         let root = open_no_follow(root)?;
         validate_directory(&root)?;
         rustix::fs::flock(&root, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+        Self::open_locked(root, instance, limits)
+    }
+
+    fn open_locked(root: File, instance: &str, limits: Limits) -> io::Result<Self> {
         let directory = child_directory(&root, instance)?;
         root.sync_all()?;
         let mut spool = Self {
@@ -242,6 +246,63 @@ impl Outbox {
             }
         }
         Ok(spool)
+    }
+
+    // Used only by the single persistence worker. try_clone shares the existing
+    // flock, so there is never a second writer or a gap in spool ownership.
+    fn historical(&self, instance: &str) -> io::Result<Option<Self>> {
+        if !canonical_id(instance) || instance == self.instance {
+            return Err(invalid("manager_history_instance"));
+        }
+        match openat(&self.root, instance, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(_) => Self::open_locked(self.root.try_clone()?, instance, self.limits).map(Some),
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn historical_batch(&mut self, instance: &str) -> io::Result<Vec<Record>> {
+        let result = self
+            .historical(instance)
+            .and_then(|spool| spool.map_or_else(|| Ok(Vec::new()), |spool| spool.batch()));
+        // Historical recovery can quarantine an interrupted record. Refresh even
+        // after failure, without treating a read as recovery of a write failure.
+        let refreshed = self.refresh_budget();
+        result.and_then(|batch| refreshed.map(|_| batch))
+    }
+
+    pub fn historical_ack(&mut self, records: &[Record]) -> io::Result<()> {
+        let instance = &records
+            .first()
+            .ok_or_else(|| invalid("manager_history_empty_ack"))?
+            .event
+            .instance_id;
+        let result = self
+            .historical(instance)?
+            .ok_or_else(|| invalid("manager_history_missing"))?
+            .acknowledge(records);
+        let refreshed = self.refresh_budget();
+        result.and(refreshed)
+    }
+
+    pub fn historical_append(&mut self, events: &[Event]) -> io::Result<()> {
+        let instance = &events.first().ok_or_else(|| invalid("manager_history_empty"))?.instance_id;
+        if events.len() > 2
+            || instance == &self.instance
+            || !canonical_id(instance)
+            || events.iter().any(|event| &event.instance_id != instance)
+        {
+            return Err(invalid("manager_history_instance"));
+        }
+        let result = (|| {
+            let mut previous = Self::open_locked(self.root.try_clone()?, instance, self.limits)?;
+            for event in events {
+                previous.append(event)?;
+            }
+            Ok(())
+        })();
+        let refreshed = self.refresh_budget();
+        result.and(refreshed)
     }
 
     fn recover_records(&mut self) -> io::Result<()> {
@@ -648,6 +709,35 @@ mod tests {
     fn event(sequence: i64) -> Event {
         Event::new(INSTANCE, sequence, "gallery.download.initialized", serde_json::json!({"gid":123})).unwrap()
     }
+    #[test]
+    fn historical_delivery_shares_lock_preserves_bytes_and_refreshes_live_budget() {
+        let root = private_root();
+        let other = "22222222-2222-4222-8222-222222222222";
+        let limits = Limits {
+            records: 1,
+            bytes: 64 * 1024,
+        };
+        let original = event(0);
+        let mut previous = Outbox::open(root.path(), INSTANCE, limits).unwrap();
+        previous.append(&original).unwrap();
+        drop(previous);
+        let mut live = Outbox::open(root.path(), other, limits).unwrap();
+        let next = Event::new(other, 0, "gallery.download.initialized", serde_json::json!({"gid":456})).unwrap();
+        assert!(live.append(&next).is_err());
+        let batch = live.historical_batch(INSTANCE).unwrap();
+        assert_eq!(batch[0].bytes, original.encode().unwrap());
+        assert!(Outbox::open(root.path(), INSTANCE, limits).is_err());
+        assert!(live.historical_batch(other).is_err());
+        live.historical_ack(&batch).unwrap();
+        assert!(live.historical_batch(INSTANCE).unwrap().is_empty());
+        live.append(&next).unwrap();
+        assert_eq!(live.depth(), 1);
+        assert!(Outbox::open(root.path(), other, limits).is_err());
+        let unknown = "33333333-3333-4333-8333-333333333333";
+        assert!(live.historical_batch(unknown).unwrap().is_empty());
+        assert!(!root.path().join(unknown).exists());
+    }
+
     #[test]
     fn restart_preserves_exact_record_and_ack_loss_is_safe() {
         let root = private_root();

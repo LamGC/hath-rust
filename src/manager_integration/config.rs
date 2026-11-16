@@ -9,6 +9,10 @@ use std::{
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Config {
+    // Only the External startup coordinator may populate a durable boot identity.
+    // Managed JSON cannot opt out of its process-bound admission using this field.
+    #[serde(skip)]
+    pub external: Option<ExternalConnection>,
     pub instance_id: String,
     pub stable_instance_key: String,
     pub rpc_url: String,
@@ -18,6 +22,13 @@ pub(super) struct Config {
     pub heartbeat_millis: u64,
     #[serde(default = "default_snapshot")]
     pub snapshot_millis: u64,
+}
+
+#[derive(Clone)]
+pub(super) struct ExternalConnection {
+    pub identity: super::protocol::ExternalIdentity,
+    pub allow_private_http: bool,
+    pub ca_certificate_file: Option<PathBuf>,
 }
 
 fn default_heartbeat() -> u64 {
@@ -44,6 +55,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> io::Result<()> {
+        if let Some(external) = &self.external {
+            external.identity.validate().map_err(invalid)?;
+            if external.ca_certificate_file.as_ref().is_some_and(|path| !path.is_absolute()) {
+                return Err(invalid("manager_ca_path_invalid"));
+            }
+        }
         if !canonical_id(&self.instance_id)
             || !safe_segment(&self.stable_instance_key)
             || !self.credential_file.is_absolute()
@@ -66,8 +83,9 @@ impl Config {
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| ip.is_loopback())
         });
+        let http_allowed = self.external.as_ref().map_or(loopback, |external| external.allow_private_http);
         if !matches!(url.scheme(), "http" | "https")
-            || !loopback && url.scheme() != "https"
+            || !http_allowed && url.scheme() != "https"
             || !url.username().is_empty()
             || url.password().is_some()
             || url.query().is_some()
@@ -81,8 +99,15 @@ impl Config {
     }
 
     pub fn token(&self) -> io::Result<Token> {
-        let bytes = read_private(&self.credential_file, 128)?;
+        let bytes = read_private(&self.credential_file, if self.external.is_some() { 514 } else { 128 })?;
         let value = String::from_utf8(bytes).map_err(|_| invalid("manager_credential_invalid"))?;
+        if self.external.is_some() {
+            let value = value.trim_end_matches(['\r', '\n']);
+            if !(32..=512).contains(&value.len()) || !value.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
+                return Err(invalid("manager_credential_invalid"));
+            }
+            return Ok(Token(value.to_owned()));
+        }
         if value.len() != 43 || !value.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
             return Err(invalid("manager_credential_invalid"));
         }
@@ -184,7 +209,7 @@ pub(super) fn open_no_follow(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(unix))]
-fn read_private(_path: &Path, _maximum: u64) -> io::Result<Vec<u8>> {
+pub(super) fn read_private(_path: &Path, _maximum: u64) -> io::Result<Vec<u8>> {
     Err(invalid("manager_integration_requires_linux"))
 }
 
@@ -194,6 +219,7 @@ mod tests {
 
     fn config(url: &str) -> Config {
         Config {
+            external: None,
             instance_id: "11111111-1111-4111-8111-111111111111".into(),
             stable_instance_key: "primary".into(),
             rpc_url: url.into(),
@@ -217,6 +243,30 @@ mod tests {
         for url in ["http://127.0.0.1:8088/", "http://[::1]:8088/", "https://example.com/"] {
             assert!(config(url).endpoint().is_ok());
         }
+    }
+    #[test]
+    fn external_https_default_and_explicit_http_do_not_change_managed_policy() {
+        let mut c = config("http://127.0.0.1/");
+        c.external = Some(ExternalConnection {
+            identity: super::super::protocol::ExternalIdentity {
+                identity_id: "external".into(),
+                run_generation: 1,
+                purpose: "live".into(),
+            },
+            allow_private_http: false,
+            ca_certificate_file: None,
+        });
+        assert!(c.endpoint().is_err());
+        c.rpc_url = "https://man-agent:8443/".into();
+        assert!(c.validate().is_ok());
+        c.rpc_url = "http://man-agent:8088/".into();
+        assert!(c.endpoint().is_err());
+        c.external.as_mut().unwrap().allow_private_http = true;
+        assert!(c.endpoint().is_ok());
+        c.external = None;
+        assert!(c.endpoint().is_err());
+        // External identity is not accepted from a Managed launch file.
+        assert!(super::super::protocol::decode::<Config>(br#"{"instanceId":"11111111-1111-4111-8111-111111111111","stableInstanceKey":"primary","rpcUrl":"https://node/","credentialFile":"/run/token","spoolDirectory":"/run/spool","external":{"identityId":"bypass"}}"#).is_err());
     }
     #[cfg(unix)]
     #[test]

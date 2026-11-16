@@ -4,6 +4,8 @@
 
 mod config;
 #[cfg(target_os = "linux")]
+mod external;
+#[cfg(target_os = "linux")]
 mod gallery;
 #[cfg(target_os = "linux")]
 mod http;
@@ -14,6 +16,8 @@ mod outbox;
 #[cfg(target_os = "linux")]
 mod owner;
 mod protocol;
+#[cfg(target_os = "linux")]
+mod recovery;
 #[cfg(target_os = "linux")]
 mod runtime;
 #[cfg(target_os = "linux")]
@@ -135,6 +139,7 @@ pub(crate) async fn test_runtime(
     let fixture: serde_json::Value = serde_json::from_str(include_str!("fixtures/agent-registration-native-v1.json")).unwrap();
     let identity = serde_json::from_value(fixture["nativeIdentity"].clone()).unwrap();
     let config = config::Config {
+        external: None,
         instance_id: "11111111-1111-4111-8111-111111111111".into(),
         stable_instance_key: "primary".into(),
         rpc_url: format!("http://{}/", listener.local_addr().unwrap()),
