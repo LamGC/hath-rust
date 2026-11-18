@@ -360,19 +360,19 @@ impl LoggerWorker {
         let stats = config.clone();
         let task = tokio::spawn(async move {
             let mut error = match LogFile::open(root.join("log_err"), config.managed).await {
-                Ok(file) => file,
+                Ok(file) => Some(file),
                 Err(_) => {
                     add(&config.write_failures);
-                    rx.close();
-                    return;
+                    eprintln!("event=log.error_file_unavailable");
+                    None
                 }
             };
             let mut output = match LogFile::open(root.join("log_out"), config.managed).await {
-                Ok(file) => file,
+                Ok(file) => Some(file),
                 Err(_) => {
                     add(&config.write_failures);
-                    rx.close();
-                    return;
+                    eprintln!("event=log.output_file_unavailable");
+                    None
                 }
             };
             let mut console_out = stdout();
@@ -387,25 +387,30 @@ impl LoggerWorker {
                         let mut bytes=item.message.into_bytes();bytes.push(b'\n');
                         if item.level<=Level::Warn {
                             if item.level<=console_level&&console_err.write_all(&bytes).await.is_err(){add(&config.write_failures);}
-                            if error.append(&bytes).await.is_err(){add(&config.write_failures);}
+                            if let Some(file) = &mut error
+                                && (file.append(&bytes).await.is_err() || file.file.flush().await.is_err()) {add(&config.write_failures);}
                         } else {
                             if item.level<=console_level&&console_out.write_all(&bytes).await.is_err(){add(&config.write_failures);}
-                            if config.write_info.load(Relaxed){
-                                if output.append(&bytes).await.is_err(){add(&config.write_failures);}
-                                if config.flush.load(Relaxed)&&output.file.flush().await.is_err(){add(&config.write_failures);}
+                            if config.write_info.load(Relaxed) && let Some(file) = &mut output {
+                                if file.append(&bytes).await.is_err(){add(&config.write_failures);}
+                                if config.flush.load(Relaxed)&&file.file.flush().await.is_err(){add(&config.write_failures);}
                             }
                         }
                         // The record permit lives through the in-flight disk/console write.
                         drop(item._permit);
                     },
-                    _=flush_signal.notified()=>{if output.file.flush().await.is_err(){add(&config.write_failures);}}
+                    _=flush_signal.notified()=>{
+                        for file in [&mut output, &mut error].into_iter().flatten() {
+                            if file.file.flush().await.is_err(){add(&config.write_failures);}
+                        }
+                    }
                 }
             }
-            if output.file.flush().await.is_err() {
-                add(&config.write_failures);
-            }
-            if error.file.flush().await.is_err() {
-                add(&config.write_failures);
+            for file in [output, error].into_iter().flatten() {
+                let mut writer = file.file;
+                if writer.flush().await.is_err() {
+                    add(&config.write_failures);
+                }
             }
         });
         (
@@ -425,6 +430,30 @@ impl LoggerWorker {
 mod tests {
     use super::*;
     use log::Log;
+    #[tokio::test]
+    async fn warnings_are_visible_before_shutdown_even_if_info_file_failed_to_open() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("log_out")).unwrap();
+        let config = Arc::new(LoggerConfig::default());
+        config.console_level(4);
+        let (worker, handle) = LoggerWorker::new(root.path(), config.clone());
+        worker.log(
+            &Record::builder()
+                .level(Level::Warn)
+                .args(format_args!("visible diagnostic"))
+                .build(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !std::fs::read_to_string(root.path().join("log_err")).is_ok_and(|s| s.contains("visible diagnostic")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(config.write_failures.load(Relaxed), 1);
+        worker.shutdown.notify_one();
+        handle.await.unwrap();
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn drop_does_not_block_and_shutdown_drains_the_queue() {
         let root = tempfile::tempdir().unwrap();

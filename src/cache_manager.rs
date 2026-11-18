@@ -439,7 +439,7 @@ impl CacheManager {
             return false;
         }
 
-        let old_size = async_filesize(&path).await;
+        let old_size = async_filesize(&path, true).await;
         {
             let source = file_path.to_path_buf();
             let destination = path.clone();
@@ -454,7 +454,7 @@ impl CacheManager {
         // Fix permission
         fix_permission(&path).await;
 
-        if let Some(size) = async_filesize(&path).await {
+        if let Some(size) = async_filesize(&path, false).await {
             if let Some(old_size) = old_size {
                 self.remove_accounted_size(info, old_size);
             }
@@ -934,10 +934,11 @@ impl CacheManager {
     }
 }
 
-async fn async_filesize(path: &Path) -> Option<u64> {
+async fn async_filesize(path: &Path, missing_ok: bool) -> Option<u64> {
     let path2 = path.to_path_buf();
     match spawn_blocking(move || file_real_size(path2)).await {
         Ok(Ok(size)) => Some(size),
+        Ok(Err(e)) if missing_ok && e.kind() == std::io::ErrorKind::NotFound => None,
         Ok(Err(e)) => {
             error!("Read cache file {:?} size error: {}", path, e);
             None
