@@ -42,7 +42,9 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 pub use crate::server::{cert::ParsedCert, util::ClientAddr};
 use crate::{
-    AppState, middleware, route,
+    AppState,
+    metrics::{TcpConnectionEvent, TcpConnectionMetrics},
+    middleware, route,
     server::{cert::CertStore, util::FloodControl},
     util::{aes_support, ssl_provider},
 };
@@ -125,7 +127,7 @@ impl Server {
                 return None;
             }
         };
-        let handle = Arc::new(ServerHandle::new(cert_store.clone()));
+        let handle = Arc::new(ServerHandle::new(cert_store.clone(), option.data.metrics.tcp.clone()));
 
         let acceptor = TlsAcceptor::from(Arc::new(create_ssl_config(provider.clone(), cert_store.clone())));
         let listener = match bind(SocketAddr::from((host, port))) {
@@ -258,14 +260,51 @@ fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(512).inspect(|_| info!("Server is listen on {addr}"))
 }
 
-async fn accept(listener: &mut TcpListener) -> (TcpStream, SocketAddr) {
+async fn accept(listener: &mut TcpListener, metrics: &TcpConnectionMetrics) -> (TcpStream, SocketAddr) {
     loop {
         match listener.accept().await {
             // Unmap IPv4-mapped IPv6
             Ok((stream, addr)) => return (stream, SocketAddr::new(addr.ip().to_canonical(), addr.port())),
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await, // Too many open files, retry.
+            Err(_) => {
+                metrics.record(TcpConnectionEvent::AcceptError);
+                tokio::time::sleep(Duration::from_millis(50)).await; // Too many open files, retry.
+            }
         }
     }
+}
+
+fn peer_io_closed(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof
+    )
+}
+
+fn http_connection_event(result: Result<(), hyper::Error>) -> TcpConnectionEvent {
+    use TcpConnectionEvent::*;
+    let Err(error) = result else { return HttpCompleted };
+    if error.is_timeout() {
+        return HttpHeaderTimeout; // Describes Hyper's HTTP/1 header deadline, not the TLS or outer deadline.
+    }
+    if error.is_parse() {
+        return HttpProtocolError;
+    }
+    // Producer/body I/O errors can themselves wrap UnexpectedEof. Those are
+    // not evidence of a peer disconnect, even with the same std::io kind.
+    if error.is_user() {
+        return HttpError;
+    }
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = cause {
+        if current
+            .downcast_ref::<io::Error>()
+            .is_some_and(|source| peer_io_closed(source.kind()))
+        {
+            return HttpPeerClosed;
+        }
+        cause = current.source();
+    }
+    if error.is_incomplete_message() { HttpPeerClosed } else { HttpError }
 }
 
 async fn accept_loop(
@@ -278,6 +317,7 @@ async fn accept_loop(
     h3_port: Option<u16>,
 ) {
     let (shutdown_tx, _) = watch::channel(());
+    let metrics = &handle.tcp_metrics;
     let mut flood_control = if flood_control { Some(FloodControl::new()) } else { None };
     // Add h3 Alt-svc header
     if let Some(port) = h3_port {
@@ -290,11 +330,13 @@ async fn accept_loop(
         let (stream, addr) = tokio::select! {
             biased;
             _ = handle.shutdown.cancelled() => break,
-            result = accept(&mut listener) => result,
+            result = accept(&mut listener, metrics) => result,
         };
+        metrics.record(TcpConnectionEvent::Accepted);
 
         // Flood control
         if flood_control.as_mut().is_some_and(|fc| fc.hit(addr)) {
+            metrics.record(TcpConnectionEvent::FloodBlocked);
             // Flood detected
             let _ = stream.set_zero_linger(); // RST connection
             drop(stream);
@@ -304,13 +346,28 @@ async fn accept_loop(
         // Process connection
         let acceptor = acceptor.clone();
         let http = http.clone();
+        let metrics = metrics.clone();
         let service = Extension(ClientAddr(addr)).layer(router.clone());
         let mut shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
             // TLS handshake
             let ssl_stream = match timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
-                Ok(Ok(s)) => s,
-                _ => return, // Handshake timeout or error
+                Ok(Ok(s)) => {
+                    metrics.record(TcpConnectionEvent::TlsEstablished);
+                    s
+                }
+                Ok(Err(error)) => {
+                    metrics.record(if peer_io_closed(error.kind()) {
+                        TcpConnectionEvent::TlsPeerClosed
+                    } else {
+                        TcpConnectionEvent::TlsFailed
+                    });
+                    return;
+                }
+                Err(_) => {
+                    metrics.record(TcpConnectionEvent::TlsTimeout);
+                    return;
+                }
             };
 
             // Disable nodelay after handshake
@@ -321,17 +378,22 @@ async fn accept_loop(
             let service = TowerToHyperService::new(service); // Tower to hyper trait
             let connection = http.serve_connection(stream, service);
             pin_mut!(connection);
-            let _ = timeout(Duration::from_secs(181), async {
+            let event = timeout(Duration::from_secs(181), async {
                 tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => {
                         connection.as_mut().graceful_shutdown();
-                        let _ = timeout(Duration::from_secs(10), connection).await;
+                        match timeout(Duration::from_secs(10), connection).await {
+                            Ok(result) => http_connection_event(result),
+                            Err(_) => TcpConnectionEvent::HttpShutdownTimeout,
+                        }
                     },
-                    _ = &mut connection => (),
+                    result = &mut connection => http_connection_event(result),
                 }
             })
-            .await;
+            .await
+            .unwrap_or(TcpConnectionEvent::HttpConnectionTimeout);
+            metrics.record(event);
         });
     }
 
@@ -493,13 +555,15 @@ async fn accept_loop_h3(handle: Arc<ServerHandle>, endpoint: Endpoint, router: R
 pub struct ServerHandle {
     shutdown: CancellationToken,
     cert_store: Arc<CertStore>,
+    tcp_metrics: Arc<TcpConnectionMetrics>,
 }
 
 impl ServerHandle {
-    fn new(cert_store: Arc<CertStore>) -> Self {
+    fn new(cert_store: Arc<CertStore>, tcp_metrics: Arc<TcpConnectionMetrics>) -> Self {
         Self {
             shutdown: CancellationToken::new(),
             cert_store,
+            tcp_metrics,
         }
     }
 

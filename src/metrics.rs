@@ -1,4 +1,8 @@
-use std::{fmt::Error, sync::atomic::AtomicU64, time::Instant};
+use std::{
+    fmt::Error,
+    sync::{Arc, atomic::AtomicU64},
+    time::Instant,
+};
 
 use prometheus_client::{
     collector::Collector,
@@ -36,6 +40,7 @@ pub struct Metrics {
     pub cache_received_size: Counter,
     pub cache_received_duration: Family<CacheFetchLabels, Histogram>,
     pub connections: Gauge<u64, AtomicU64>,
+    pub(crate) tcp: Arc<TcpConnectionMetrics>,
     pub static_range: Gauge,
     pub cache_capacity: Gauge,
     pub cache_count: Gauge<u64, AtomicU64>,
@@ -62,6 +67,7 @@ impl Metrics {
             Histogram::new([0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0])
         });
         let connections = Gauge::<u64, AtomicU64>::default();
+        let tcp = Arc::new(TcpConnectionMetrics::register(&mut registry));
         registry.register("cache_sent", "Number of files sent", cache_sent.clone());
         registry.register_with_unit("cache_sent_size", "Number of bytes sent", Bytes, cache_sent_size.clone());
         registry.register_with_unit("cache_sent_duration", "Histogram of cache sent", Seconds, cache_sent_duration.clone());
@@ -107,6 +113,7 @@ impl Metrics {
             cache_received_size,
             cache_received_duration,
             connections,
+            tcp,
             static_range,
             cache_capacity,
             cache_count,
@@ -116,6 +123,69 @@ impl Metrics {
             download_size,
             download_duration,
         }
+    }
+}
+
+// Fixed-cardinality TCP/TLS/HTTP/1 observations. Keep this index order in sync
+// with nativeTcpConnections version 1 and the C# Prometheus projection.
+#[derive(Clone, Copy)]
+pub(crate) enum TcpConnectionEvent {
+    Accepted,
+    AcceptError,
+    FloodBlocked,
+    TlsEstablished,
+    TlsPeerClosed,
+    TlsFailed,
+    TlsTimeout,
+    HttpCompleted,
+    HttpPeerClosed,
+    HttpHeaderTimeout,
+    HttpConnectionTimeout,
+    HttpShutdownTimeout,
+    HttpProtocolError,
+    HttpError,
+}
+
+const TCP_CONNECTION_EVENTS: [&str; 14] = [
+    "accepted",
+    "accept_error",
+    "flood_blocked",
+    "tls_established",
+    "tls_peer_closed",
+    "tls_failed",
+    "tls_timeout",
+    "http_completed",
+    "http_peer_closed",
+    "http_header_timeout",
+    "http_connection_timeout",
+    "http_shutdown_timeout",
+    "http_protocol_error",
+    "http_error",
+];
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, EncodeLabelSet)]
+struct TcpConnectionLabel {
+    event: &'static str,
+}
+
+pub(crate) struct TcpConnectionMetrics([Counter; TCP_CONNECTION_EVENTS.len()]);
+
+impl TcpConnectionMetrics {
+    fn register(registry: &mut Registry) -> Self {
+        let family = Family::<TcpConnectionLabel, Counter>::default();
+        // Hold the counters directly so the accept loop never locks the family.
+        let counters = TCP_CONNECTION_EVENTS.map(|event| family.get_or_create(&TcpConnectionLabel { event }).clone());
+        registry.register("native_tcp_connections", "TCP listener, TLS and HTTP/1 connection events (not TCP acknowledgements)", family);
+        Self(counters)
+    }
+
+    pub(crate) fn record(&self, event: TcpConnectionEvent) {
+        self.0[event as usize].inc();
+    }
+
+    #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+    pub(crate) fn snapshot(&self) -> [u64; TCP_CONNECTION_EVENTS.len()] {
+        std::array::from_fn(|i| self.0[i].get())
     }
 }
 

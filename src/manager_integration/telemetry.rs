@@ -90,7 +90,7 @@ pub(super) fn sample(
 ) -> Value {
     let mut payload = json!({"nativeTelemetryVersion":1,"clientRunning":client.is_running(),"uptimeSeconds":observer.uptime(),
         "nativeInflightHttpRequests":metrics.connections.get(),"nativeCacheScanComplete":metrics.cache_scan_complete.load(Relaxed),
-        "nativeOperations":observer.snapshot()});
+        "nativeOperations":observer.snapshot(),"nativeTcpVersion":1,"nativeTcpConnections":metrics.tcp.snapshot()});
     let mut supported = vec![
         "clientRunning",
         "uptimeSeconds",

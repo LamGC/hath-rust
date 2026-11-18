@@ -18,6 +18,8 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    io::AsyncWriteExt,
+    net::TcpStream,
     sync::{Notify, mpsc},
     task::{JoinHandle, JoinSet},
     time::{sleep, timeout},
@@ -390,6 +392,9 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
     } else {
         std::fs::write(root.path().join("token"), "invalid-unused-credential").unwrap();
     }
+    if mode == Mode::Normal {
+        command.arg("--enable-metrics");
+    }
     let mut child = ChildGuard(
         command
             .arg("--data-dir")
@@ -574,6 +579,41 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
                 tokio::join!(verify("retry", b"x"), verify("resume", b"partial-tail"));
             }
             if mode == Mode::Normal {
+                // Both fail before HTTP. One peer leaves without a handshake;
+                // the other sends a recognizable non-TLS first flight.
+                drop(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+                let mut malformed = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                malformed.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+                let tcp = timeout(Duration::from_secs(5), async {
+                    loop {
+                        let frame = rx.recv().await.unwrap();
+                        let payload = &frame["payload"];
+                        let tcp = &payload["nativeTcpConnections"];
+                        if tcp[4].as_u64().unwrap_or(0) > 0 && tcp[5].as_u64().unwrap_or(0) > 0 {
+                            assert_eq!(payload["nativeTcpVersion"], 1);
+                            break tcp.clone();
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(tcp.as_array().unwrap().len(), 14);
+                assert!(tcp[3].as_u64().unwrap() > 0);
+                assert_eq!(tcp[6], 0);
+                assert!(tcp[13].as_u64().unwrap() > 0, "the earlier bad image was a response-body error");
+                let exported = http
+                    .get(format!("https://127.0.0.1:{port}/metrics"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                for event in ["tls_peer_closed", "tls_failed"] {
+                    assert!(exported.contains(&format!("hath_native_tcp_connections_total{{event=\"{event}\"}} 1")));
+                }
                 let mut response = http
                     .get(image_url(port, &format!("{}-9-jpg", sha(b"begin-end")), "drain"))
                     .send()
