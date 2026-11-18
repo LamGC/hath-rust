@@ -56,9 +56,6 @@ impl ClientLifetime {
     pub(crate) async fn shutdown(&mut self) {
         crate::logger::event(crate::logger::Diagnostic::Stopping);
         self.stop.cancel();
-        if let Some(cache) = &self.cache {
-            cache.stop_io();
-        }
         #[cfg(all(feature = "manager-integration", target_os = "linux"))]
         if let Some(managed) = &self.managed {
             managed.stopping();
@@ -86,6 +83,11 @@ impl ClientLifetime {
             async {
                 if let Some(server) = server {
                     server.shutdown().await;
+                }
+                // HTTP has stopped admission and drained (or timed out). Until then,
+                // active responses still need their proxy writers and hash readers.
+                if let Some(cache) = &self.cache {
+                    cache.stop_io();
                 }
             },
             async {

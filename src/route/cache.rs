@@ -246,12 +246,12 @@ pub(super) async fn hath(
                         }
                         let skip = progress.saturating_sub(before) as usize;
                         let bytes = &chunk[skip..];
-                        file.write_all(bytes).await.map_err(|_| ())?;
+                        write_proxy_chunk(&mut file, bytes, downloaded, file_size, &progress_tx)
+                            .await
+                            .map_err(|_| ())?;
                         hasher.update(bytes);
-                        progress += bytes.len() as u64;
+                        progress = downloaded;
                         worker_data.metrics.cache_received_size.inc_by(bytes.len() as u64);
-                        // Never release the final byte before exact-length/hash/fsync validation.
-                        progress_tx.send_replace(progress.min(file_size.saturating_sub(1)));
                     }
                     if progress != file_size {
                         continue;
@@ -290,11 +290,10 @@ pub(super) async fn hath(
         }
         (temp_path, tx.subscribe())
     };
-    if *rx.borrow() == 0
-        && !timeout(Duration::from_secs(30), rx.changed())
-            .await
-            .is_ok_and(|result| result.is_ok())
-    {
+    // Only the producer should keep this channel alive. Let its bounded source retries
+    // (and the outer HTTP deadline), not a second one-attempt timeout, govern first byte.
+    drop(tx);
+    if rx.wait_for(|visible| *visible > 0).await.is_err() {
         return not_found();
     }
     let result = response
@@ -312,13 +311,24 @@ pub(super) async fn hath(
                         Err(error)=>{yield Err(error);return;}
                     }
                     if offset==file_size{return;}
-                }else if !timeout(Duration::from_secs(30),rx.changed()).await.is_ok_and(|result|result.is_ok()){
+                }else if rx.changed().await.is_err(){
+                    // A retry can legitimately take longer than one source timeout, even
+                    // after headers were sent. Only writer termination proves an incomplete body.
                     yield Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,"proxy_upstream_incomplete"));return;
                 }
             }
         }))
         .unwrap();
     image_response(result, false, file_size)
+}
+
+async fn write_proxy_chunk(file: &mut File, bytes: &[u8], end: u64, file_size: u64, visible: &watch::Sender<u64>) -> std::io::Result<()> {
+    file.write_all(bytes).await?;
+    // Tokio can return from write_all with the last write still queued. Readers use a separate file handle.
+    file.flush().await?;
+    // The final byte is released by the caller after exact-length/hash/fsync validation.
+    visible.send_replace(end.min(file_size.saturating_sub(1)));
+    Ok(())
 }
 
 fn image_response(response: Response, local: bool, bytes: u64) -> Response {
@@ -339,5 +349,49 @@ fn image_response(response: Response, local: bool, bytes: u64) -> Response {
     {
         let _ = (local, bytes);
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[test]
+    fn proxy_progress_only_announces_readable_bytes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = File::from_std(tmp.reopen().unwrap());
+            let mut reader = tmp.reopen().unwrap();
+            let (tx, rx) = watch::channel(0);
+
+            // Hold the filesystem worker: write_all can accept bytes but the reader must not be woken yet.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = held.recv();
+            });
+            ready.await.unwrap();
+            let mut first = Box::pin(write_proxy_chunk(&mut writer, b"ab", 2, 4, &tx));
+            let pending = futures::poll!(&mut first).is_pending();
+            let before = *rx.borrow();
+            let length = reader.metadata().unwrap().len();
+            drop(release);
+            assert_eq!((pending, before, length), (true, 0, 0));
+            first.await.unwrap();
+            blocker.await.unwrap();
+
+            assert_eq!(*rx.borrow(), 2);
+            let mut bytes = [0; 2];
+            reader.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"ab");
+            write_proxy_chunk(&mut writer, b"cd", 4, 4, &tx).await.unwrap();
+            assert_eq!(*rx.borrow(), 3, "final byte must wait for validation");
+        });
     }
 }

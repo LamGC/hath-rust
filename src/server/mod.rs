@@ -1,10 +1,7 @@
 use std::{
     io,
     net::{IpAddr, SocketAddr},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Duration,
     vec,
 };
@@ -34,11 +31,12 @@ use rustls::{
 };
 use tokio::{
     net::{TcpListener, TcpSocket, TcpStream},
-    sync::{Notify, watch},
+    sync::watch,
     task::JoinHandle,
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -288,15 +286,11 @@ async fn accept_loop(
         router = router.layer(h3_header)
     }
     loop {
-        if handle.shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
         // Wait for new tcp connection
         let (stream, addr) = tokio::select! {
             biased;
+            _ = handle.shutdown.cancelled() => break,
             result = accept(&mut listener) => result,
-            _ = handle.shutdown_notify.notified() => break, // Shutdown
         };
 
         // Flood control
@@ -325,15 +319,19 @@ async fn accept_loop(
             // Process request
             let stream = TokioIo::new(ssl_stream); // Tokio to hyper trait
             let service = TowerToHyperService::new(service); // Tower to hyper trait
-            let fut = timeout(Duration::from_secs(181), http.serve_connection(stream, service));
-            pin_mut!(fut);
-            tokio::select! {
-                biased;
-                _ = &mut fut => (),
-                _ = shutdown_rx.changed() => { // Graceful shutdown
-                    let _ = timeout(Duration::from_secs(10), fut).await;
-                },
-            };
+            let connection = http.serve_connection(stream, service);
+            pin_mut!(connection);
+            let _ = timeout(Duration::from_secs(181), async {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        connection.as_mut().graceful_shutdown();
+                        let _ = timeout(Duration::from_secs(10), connection).await;
+                    },
+                    _ = &mut connection => (),
+                }
+            })
+            .await;
         });
     }
 
@@ -355,15 +353,11 @@ async fn accept_loop_h3(handle: Arc<ServerHandle>, endpoint: Endpoint, router: R
     };
 
     loop {
-        if handle.shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
         // Wait new connection
         let new_conn = tokio::select! {
             biased;
+            _ = handle.shutdown.cancelled() => break,
             Some(result) = endpoint.accept() => result,
-            _ = handle.shutdown_notify.notified() => break, // Shutdown
         };
 
         let addr = new_conn.remote_address();
@@ -400,12 +394,12 @@ async fn accept_loop_h3(handle: Arc<ServerHandle>, endpoint: Endpoint, router: R
                 // Accept request
                 let resolver = tokio::select! {
                     biased;
-                    resolver = h3_conn.accept() => resolver,
                     _ = shutdown_rx.changed() => { // Graceful shutdown
                         let _ = h3_conn.shutdown(1).await; // Send GOAWAY
                         close_wait.closed().await; // Drop h3_conn will reset request, wait for request complete
                         break;
                     },
+                    resolver = h3_conn.accept() => resolver,
                 };
                 let resolver = match resolver {
                     Ok(Some(resolver)) => resolver,
@@ -497,16 +491,14 @@ async fn accept_loop_h3(handle: Arc<ServerHandle>, endpoint: Endpoint, router: R
 }
 
 pub struct ServerHandle {
-    shutdown: AtomicBool,
-    shutdown_notify: Notify,
+    shutdown: CancellationToken,
     cert_store: Arc<CertStore>,
 }
 
 impl ServerHandle {
     fn new(cert_store: Arc<CertStore>) -> Self {
         Self {
-            shutdown: AtomicBool::new(false),
-            shutdown_notify: Notify::new(),
+            shutdown: CancellationToken::new(),
             cert_store,
         }
     }
@@ -516,7 +508,6 @@ impl ServerHandle {
     }
 
     fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown.cancel();
     }
 }
