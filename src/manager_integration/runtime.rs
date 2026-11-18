@@ -49,7 +49,7 @@ struct State {
     phase: AtomicU8,
     link_healthy: AtomicBool,
     persistence_healthy: AtomicBool,
-    recovery_ready: AtomicBool,
+    recovery_ready: watch::Sender<bool>,
     quarantined: AtomicUsize,
     outbox_depth: AtomicUsize,
     outbox_bytes: AtomicU64,
@@ -78,7 +78,7 @@ impl State {
             integration_ready: true,
             persistence_healthy: self.persistence_healthy.load(Relaxed)
                 && self.quarantined.load(Relaxed) == 0
-                && self.recovery_ready.load(Relaxed),
+                && *self.recovery_ready.borrow(),
             client_ready: self.phase.load(Relaxed) == Phase::Active as u8,
         })
     }
@@ -88,7 +88,7 @@ impl State {
             .map_err(|_| invalid("manager_sequence_exhausted"))
     }
     fn status(&self) -> &'static str {
-        if !self.persistence_healthy.load(Relaxed) || self.quarantined.load(Relaxed) != 0 || !self.recovery_ready.load(Relaxed) {
+        if !self.persistence_healthy.load(Relaxed) || self.quarantined.load(Relaxed) != 0 || !*self.recovery_ready.borrow() {
             "degraded"
         } else {
             match self.phase.load(Relaxed) {
@@ -162,7 +162,7 @@ impl IntegrationHandle {
         }
         self.inner.as_ref().map(|enabled| Health {
             link_healthy: enabled.state.link_healthy.load(Relaxed),
-            persistence_healthy: enabled.state.persistence_healthy.load(Relaxed) && enabled.state.recovery_ready.load(Relaxed),
+            persistence_healthy: enabled.state.persistence_healthy.load(Relaxed) && *enabled.state.recovery_ready.borrow(),
             quarantined: enabled.state.quarantined.load(Relaxed),
             outbox_depth: enabled.state.outbox_depth.load(Relaxed),
         })
@@ -185,14 +185,24 @@ impl IntegrationHandle {
         self.phase(Phase::Stopping);
     }
 
+    // Recovery is a one-way gate. Waiting before fetchqueue retains this downloader
+    // invocation without allocating an attempt, a sequence or a second queue worker.
+    pub(crate) async fn wait_for_gallery_recovery(&self) -> io::Result<()> {
+        self.ensure_available()?;
+        if let Some(enabled) = &self.inner {
+            let mut ready = enabled.state.recovery_ready.subscribe();
+            ready
+                .wait_for(|value| *value)
+                .await
+                .map_err(|_| invalid("manager_recovery_stopped"))?;
+        }
+        Ok(())
+    }
+
     // The future Gallery façade owns event creation/journaling, so retry uses the same Event.
     pub(super) fn event(&self, kind: &str, payload: Value) -> io::Result<Option<Event>> {
         self.ensure_available()?;
-        if self
-            .inner
-            .as_ref()
-            .is_some_and(|enabled| !enabled.state.recovery_ready.load(Relaxed))
-        {
+        if self.inner.as_ref().is_some_and(|enabled| !*enabled.state.recovery_ready.borrow()) {
             return Err(invalid("manager_recovery_pending"));
         }
         self.inner
@@ -308,7 +318,7 @@ impl Runtime {
             phase: AtomicU8::new(Phase::Starting as u8),
             link_healthy: AtomicBool::new(false),
             persistence_healthy: AtomicBool::new(false),
-            recovery_ready: AtomicBool::new(source.is_none()),
+            recovery_ready: watch::channel(source.is_none()).0,
             quarantined: AtomicUsize::new(0),
             outbox_depth: AtomicUsize::new(0),
             outbox_bytes: AtomicU64::new(0),
@@ -341,7 +351,7 @@ impl Runtime {
             tokio::spawn(async move {
                 let result = super::recovery::run(source, boots, storage, ready, state.wake.clone(), cancellation.clone()).await;
                 if result.is_ok() && !*cancellation.borrow() {
-                    state.recovery_ready.store(true, Relaxed);
+                    state.recovery_ready.send_replace(true);
                     state.health_dirty.store(true, Relaxed);
                     state.wake.notify_one();
                 }

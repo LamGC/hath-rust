@@ -54,6 +54,7 @@ struct Mock {
     release_start: Notify,
     registrations: Mutex<Vec<Value>>,
     completed: Mutex<Vec<Value>>,
+    drain_release: CancellationToken,
 }
 fn sha(bytes: &[u8]) -> String {
     const_hex::encode(digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, bytes))
@@ -160,13 +161,22 @@ async fn control(State(mock): State<Arc<Mock>>, uri: Uri) -> Response<Body> {
         "fetchqueue" if add.is_empty() => {
             let row = "1 10 org unknown jpg 001";
             format!(
-                "GID 123\nTITLE Example Gallery\nMINXRES org\nFILECOUNT 1\nDLHASH {}\nFILELIST\n{row}\nINFORMATION\nSynthetic test gallery",
-                sha(format!("{KEY}\n{row}").as_bytes())
+                "GID 123\nTITLE Example Gallery\nMINXRES org\nFILECOUNT 1\nDLHASH {}\nFILELIST\n{row}\nINFORMATION\n{}",
+                sha(format!("{KEY}\n{row}").as_bytes()),
+                "界".repeat(3000)
             )
         }
         "fetchqueue" => "NO_PENDING_DOWNLOADS".into(),
         "dlfetch" => signed(&format!("http://{}/image", mock.address)),
         "srfetch" if add.starts_with("empty;") => signed(""),
+        "srfetch" if add.starts_with("drain;") => signed(&format!("http://{}/stream", mock.address)),
+        "srfetch" if add.starts_with("retry;") => {
+            signed(&format!("http://{0}/slow-one\nhttp://{0}/slow-one\nhttp://{0}/one", mock.address))
+        }
+        "srfetch" if add.starts_with("resume;") => {
+            signed(&format!("http://{0}/slow-prefix\nhttp://{0}/slow-prefix\nhttp://{0}/resumed", mock.address))
+        }
+        "srfetch" if add.starts_with("missing;") => signed(&format!("http://{}/404", mock.address)),
         "srfetch" if add.starts_with("bad;") => signed(&format!("http://{}/bad-image", mock.address)),
         "srfetch" => signed(&format!("http://{}/image", mock.address)),
         other => panic!("unexpected mock action {other}"),
@@ -255,6 +265,9 @@ async fn signal_and_wait(child: &mut ChildGuard) -> std::process::ExitStatus {
     .unwrap()
 }
 async fn scenario(mode: Mode) {
+    scenario_inner(mode, false).await;
+}
+async fn scenario_inner(mode: Mode, slow_retry: bool) {
     let root = tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     for name in ["data", "cache", "download", "tmp", "log", "spool"] {
@@ -282,6 +295,7 @@ async fn scenario(mode: Mode) {
         release_start: Notify::new(),
         registrations: Mutex::new(Vec::new()),
         completed: Mutex::new(Vec::new()),
+        drain_release: CancellationToken::new(),
     });
     let stop = CancellationToken::new();
     let router = Router::new()
@@ -289,6 +303,45 @@ async fn scenario(mode: Mode) {
         .route("/16/dl", get(control))
         .route("/image", get(|| async { b"image-one".to_vec() }))
         .route("/bad-image", get(|| async { b"image-two".to_vec() }))
+        .route(
+            "/slow-prefix",
+            get(|| async {
+                sleep(Duration::from_secs(7)).await;
+                Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"partial"));
+                    sleep(Duration::from_secs(60)).await;
+                    yield Ok(Bytes::from_static(b"-tail"));
+                })
+            }),
+        )
+        .route(
+            "/resumed",
+            get(|| async {
+                sleep(Duration::from_secs(6)).await;
+                "partial-tail"
+            }),
+        )
+        .route("/one", get(|| async { "x" }))
+        .route(
+            "/slow-one",
+            get(|| async {
+                sleep(Duration::from_secs(7)).await;
+                Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"x"));
+                    sleep(Duration::from_secs(60)).await;
+                })
+            }),
+        )
+        .route(
+            "/stream",
+            get(|State(mock): State<Arc<Mock>>| async move {
+                Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"begin"));
+                    mock.drain_release.cancelled().await;
+                    yield Ok(Bytes::from_static(b"-end"));
+                })
+            }),
+        )
         .with_state(mock.clone());
     let control_task: JoinHandle<()> = tokio::spawn(serve(control_listener, router, stop.clone()));
     let router = Router::new()
@@ -317,6 +370,9 @@ async fn scenario(mode: Mode) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     if mode == Mode::External {
+        let pending = root.path().join("download/recovery-blocked");
+        std::fs::create_dir(&pending).unwrap();
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o777)).unwrap();
         let settings = json!({"mode":"external","identityId":"external-test","rpcUrl":endpoint,
             "credentialFile":root.path().join("token"),"spoolDirectory":spool,"downloadRoot":root.path().join("download"),
             "allowPrivateHttp":true,"heartbeatMillis":1000,"snapshotMillis":1000});
@@ -393,6 +449,13 @@ async fn scenario(mode: Mode) {
                 sha(format!("hentai@home-servercmd-start_downloader-none-1001-{time}-{KEY}").as_bytes())
             );
             assert_eq!(http.get(url).send().await.unwrap().status(), StatusCode::OK);
+            if mode == Mode::External {
+                // Wait until the real dispatcher consumed the only start command, with recovery still blocked.
+                let payload = wait_for_telemetry(&mut rx).await;
+                assert_eq!(payload["nativePersistenceHealthy"], false);
+                assert!(!mock.actions.lock().unwrap().iter().any(|act| act == "fetchqueue"));
+                std::fs::remove_dir(root.path().join("download/recovery-blocked")).unwrap();
+            }
             if mode == Mode::Normal || mode == Mode::NoTelemetry || mode == Mode::External {
                 let terminal = timeout(Duration::from_secs(10), async {
                     loop {
@@ -414,6 +477,8 @@ async fn scenario(mode: Mode) {
                 let metadata: Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(metadata["schemaVersion"], 2);
                 assert_eq!(metadata["status"], "completed");
+                assert_eq!(metadata["information"], "界".repeat(2730));
+                assert_eq!(std::fs::read_to_string(Path::new(path).with_file_name("galleryinfo.txt")).unwrap(), "界".repeat(3000) + "\n");
                 assert_eq!(metadata["files"].as_array().unwrap().len(), 1);
                 if mode == Mode::NoTelemetry {
                     assert!(
@@ -475,6 +540,7 @@ async fn scenario(mode: Mode) {
                 .unwrap();
                 let directory = root.path().join("download/Example Gallery [123]");
                 assert_eq!(std::fs::read(directory.join("001.jpg")).unwrap(), b"image-one");
+                assert_eq!(std::fs::read_to_string(directory.join("galleryinfo.txt")).unwrap(), "界".repeat(3000) + "\n");
                 assert!(!directory.join(".hath-manager.json").exists());
                 assert_eq!(std::fs::read_dir(&spool).unwrap().count(), 0);
                 assert!(!mock.actions.lock().unwrap().iter().any(|action| action.starts_with("manager:")));
@@ -496,7 +562,40 @@ async fn scenario(mode: Mode) {
                     0o640
                 );
             }
-            assert!(signal_and_wait(&mut child).await.success());
+            if slow_retry {
+                let verify = |index, expected: &'static [u8]| {
+                    let request = http.get(image_url(port, &format!("{}-{}-jpg", sha(expected), expected.len()), index));
+                    async move {
+                        let response = request.timeout(Duration::from_secs(55)).send().await.unwrap();
+                        assert_eq!(response.status(), StatusCode::OK);
+                        assert_eq!(response.bytes().await.unwrap().as_ref(), expected);
+                    }
+                };
+                tokio::join!(verify("retry", b"x"), verify("resume", b"partial-tail"));
+            }
+            if mode == Mode::Normal {
+                let mut response = http
+                    .get(image_url(port, &format!("{}-9-jpg", sha(b"begin-end")), "drain"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.chunk().await.unwrap().unwrap().as_ref(), b"begin");
+                let (status, tail) = tokio::join!(signal_and_wait(&mut child), async {
+                    timeout(Duration::from_secs(3), async {
+                        while !mock.actions.lock().unwrap().iter().any(|act| act == "client_stop") {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    mock.drain_release.cancel();
+                    response.bytes().await.unwrap()
+                });
+                assert_eq!(tail.as_ref(), b"-end");
+                assert!(status.success());
+            } else {
+                assert!(signal_and_wait(&mut child).await.success());
+            }
             assert_eq!(
                 mock.actions
                     .lock()
@@ -589,16 +688,17 @@ async fn scenario(mode: Mode) {
     }
 }
 
+fn image_url(port: u16, id: &str, index: &str) -> String {
+    let time = chrono::Utc::now().timestamp();
+    format!(
+        "https://127.0.0.1:{port}/h/{id}/keystamp={time}-{};fileindex={index}/secret-name.jpg",
+        sha(format!("{time}-{id}-{KEY}-hotlinkthis").as_bytes())
+    )
+}
 async fn exercise_image_http(http: &reqwest::Client, port: u16, root: &Path) {
     let hash = sha(b"image-one");
     let id = format!("{hash}-9-jpg");
-    let url = |id: &str, index: &str| {
-        let time = chrono::Utc::now().timestamp();
-        format!(
-            "https://127.0.0.1:{port}/h/{id}/keystamp={time}-{};fileindex={index}/secret-name.jpg",
-            sha(format!("{time}-{id}-{KEY}-hotlinkthis").as_bytes())
-        )
-    };
+    let url = |id: &str, index: &str| image_url(port, id, index);
     let path = root.join("cache").join(&hash[..2]).join(&hash[2..4]).join(&id);
     let first = http.get(url(&id, "valid")).send().await.unwrap();
     assert_eq!(first.status(), StatusCode::OK);
@@ -635,6 +735,13 @@ async fn exercise_image_http(http: &reqwest::Client, port: u16, root: &Path) {
     assert!(bad.bytes().await.is_err());
     // Empty source sets are ordinary misses, never a worker panic or an infinite body.
     assert_eq!(http.get(url(&bad_id, "empty")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert_eq!(http.get(url(&bad_id, "missing")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "extra: crosses the former 30-second reader deadlines with real source retries"]
+async fn actual_cli_backup_serves_visitor_before_and_after_first_byte() {
+    scenario_inner(Mode::Standalone, true).await;
 }
 async fn wait_for_telemetry(rx: &mut mpsc::Receiver<Value>) -> Value {
     timeout(Duration::from_secs(5), async {

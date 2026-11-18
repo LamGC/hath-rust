@@ -25,6 +25,11 @@ const JOURNAL: &str = ".hath-manager.download-handoff.json";
 const PENDING: &str = ".hath-manager.download-metadata.pending";
 const METADATA: &str = ".hath-manager.json";
 const MAX_METADATA: usize = 16 * 1024 * 1024;
+const MAX_WIRE_INFORMATION: usize = 8192;
+
+fn wire_information(text: &str) -> &str {
+    &text[..text.floor_char_boundary(MAX_WIRE_INFORMATION.min(text.len()))]
+}
 
 pub(crate) struct FileView<'a> {
     pub page: usize,
@@ -66,7 +71,7 @@ impl Description {
             || view.title().is_empty()
             || view.title().len() > 4096
             || view.title().chars().any(char::is_control)
-            || view.information().len() > 8192
+            || view.information().len() > crate::gallery_downloader::MAX_GALLERY_METADATA_BYTES
             || view.information().contains('\0')
         {
             return Err(invalid("gallery_view_invalid"));
@@ -120,6 +125,9 @@ struct Journal {
 struct Terminal {
     ready: bool,
     metadata_sha256: String,
+    // Only needed when the private local galleryinfo.txt exceeds the wire preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    full_information_sha256: Option<String>,
     event: Event,
 }
 
@@ -368,7 +376,7 @@ fn prepare_terminal_inner(
                     gallery_token: None,
                     min_x_res: description.resolution.clone(),
                     title: description.title.clone(),
-                    information: description.information.clone(),
+                    information: wire_information(&description.information).into(),
                     hath: Hath {
                         client_version: env!("CARGO_PKG_VERSION").into(),
                         client_build: None,
@@ -393,7 +401,7 @@ fn prepare_terminal_inner(
         };
         let document: Metadata = protocol::decode_limit(&metadata, MAX_METADATA).map_err(invalid)?;
         if (document.status == "completed") != success
-            || document.information != description.information
+            || document.information != wire_information(&description.information)
             || success
                 && (document.files.len() != description.files.len()
                     || document.files.iter().zip(&description.files).any(|(file, planned)| {
@@ -421,6 +429,8 @@ fn prepare_terminal_inner(
         journal.terminal = Some(Terminal {
             ready: false,
             metadata_sha256: sha256(&metadata),
+            full_information_sha256: (success && description.information.len() > MAX_WIRE_INFORMATION)
+                .then(|| sha256(description.information.as_bytes())),
             event,
         });
         // This is the durable terminal decision; staged files alone never authorize replay.
@@ -540,6 +550,7 @@ pub(super) fn recover_external_attempt(directory: &Path, boot: &super::external:
         journal.terminal = Some(Terminal {
             ready: false,
             metadata_sha256: sha256(&bytes),
+            full_information_sha256: None,
             event: terminal,
         });
         directory.replace(JOURNAL, &encode(&journal, 64 * 1024)?)?;
@@ -685,7 +696,7 @@ fn recover_commit(
         || Some(metadata.title.as_str()) != journal.initialized.payload["title"].as_str()
         || Some(metadata.min_x_res.as_str()) != journal.initialized.payload["minXRes"].as_str()
         || metadata.gallery_token.is_some()
-        || metadata.information.len() > 8192
+        || metadata.information.len() > MAX_WIRE_INFORMATION
         || metadata.hath.client_version != identity.client_version
         || metadata.hath.client_build.is_some()
         || metadata.hath.jar_sha256.is_some()
@@ -712,7 +723,16 @@ fn recover_commit(
         }
         directory.verify_image(&file.relative_path, file.size, file.expected_sha1.as_deref())?;
     }
-    if success {
+    if let Some(hash) = &terminal.full_information_sha256 {
+        let full = directory.read("galleryinfo.txt", crate::gallery_downloader::MAX_GALLERY_METADATA_BYTES)?;
+        if !success
+            || full.len() <= MAX_WIRE_INFORMATION
+            || sha256(&full) != *hash
+            || std::str::from_utf8(&full).map(wire_information).ok() != Some(metadata.information.as_str())
+        {
+            return Err(invalid("gallery_information_conflict"));
+        }
+    } else if success {
         directory.immutable("galleryinfo.txt", metadata.information.as_bytes())?;
     }
     directory.immutable(METADATA, &bytes)?;

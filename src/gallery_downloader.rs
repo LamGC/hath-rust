@@ -30,6 +30,7 @@ use crate::{error::Error, metrics::Metrics, rpc::RPCClient, util};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const MAX_DOWNLOAD_TASK: u32 = 4;
+pub(crate) const MAX_GALLERY_METADATA_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(all(feature = "manager-integration", target_os = "linux"))]
 type GalleryObservation = Option<GalleryAttempt>;
 #[cfg(not(all(feature = "manager-integration", target_os = "linux")))]
@@ -72,6 +73,15 @@ impl GalleryDownloader {
 
     pub async fn run(&self, stop: CancellationToken) {
         let stop = stop.child_token();
+        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+        tokio::select! {
+            biased;
+            _ = stop.cancelled() => return,
+            ready = self.integration.wait_for_gallery_recovery() => if ready.is_err() {
+                warn!("Gallery recovery is unavailable; upstream queue left untouched");
+                return;
+            },
+        }
         let mut task = tokio::select! { biased; _ = stop.cancelled() => None, task = self.client.fetch_queue(None) => task }
             .map(|meta| self.parser(meta));
 
@@ -364,7 +374,7 @@ impl GalleryMeta {
         let mut headers = HashSet::new();
         let mut pages = HashSet::new();
         let mut paths = HashSet::new();
-        if raw_gallery.len() > 10032 || raw_gallery.iter().map(String::len).sum::<usize>() > 8 * 1024 * 1024 {
+        if raw_gallery.len() > 10032 || raw_gallery.iter().map(String::len).sum::<usize>() > MAX_GALLERY_METADATA_BYTES {
             return Err("gallery_metadata_limit".into());
         }
         for s in raw_gallery {
@@ -484,7 +494,7 @@ impl GalleryMeta {
                 }))
             } else {
                 // Gallery info
-                if information.len() + s.len() + 1 > 8192 || s.contains('\0') {
+                if information.len() + s.len() + 1 > MAX_GALLERY_METADATA_BYTES || s.contains('\0') {
                     return Err("gallery_metadata_information".into());
                 }
                 information.push_str(s);
@@ -853,8 +863,16 @@ mod tests {
         assert!(GalleryMeta::parse(&duplicate, "test-key").is_err());
         assert!(GalleryMeta::parse(&valid, "different-key").is_err());
         let mut oversized = valid.clone();
-        oversized.push("x".repeat(8193));
+        oversized.push("x".repeat(MAX_GALLERY_METADATA_BYTES));
         assert!(GalleryMeta::parse(&oversized, "test-key").is_err());
+    }
+
+    #[test]
+    fn gallery_information_is_not_limited_by_the_manager_projection() {
+        let mut raw = metadata(&["1 10 org unknown jpg 001"]);
+        let text = "界".repeat(3000);
+        *raw.last_mut().unwrap() = text.clone();
+        assert_eq!(GalleryMeta::parse(&raw, "test-key").unwrap().information, text + "\n");
     }
 
     struct BrokenReader(usize);
