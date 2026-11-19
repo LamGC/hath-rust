@@ -35,7 +35,7 @@ use crate::{
     metrics::{LABEL_CACHE_DOWNLOAD, LABEL_CACHE_FETCH_URL},
     route::{forbidden, not_found, parse_additional},
     server::util::TruncateBody,
-    util::{create_http_client, string_to_hash},
+    util::{create_cache_origin_http_client, string_to_hash},
 };
 
 const TTL: RangeInclusive<i64> = -900..=900; // Token TTL 15 minutes
@@ -187,6 +187,10 @@ pub(super) async fn hath(
             Some(sources) if !sources.is_empty() => sources,
             _ => return not_found(),
         };
+        // Wire format used by the official H@H client's image origin requests.
+        let origin_signature = string_to_hash(format!("{}{file_id}", data.rpc.key()));
+        let mut origin_auth = HeaderValue::from_str(&format!("{}-{origin_signature}", data.rpc.id())).unwrap();
+        origin_auth.set_sensitive(true);
         data.metrics
             .cache_received_duration
             .get_or_create(&LABEL_CACHE_FETCH_URL)
@@ -207,7 +211,7 @@ pub(super) async fn hath(
                 let download_time = Instant::now();
                 let mut progress = 0u64;
                 let mut hasher = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
-                let mut client = worker_data.reqwest.clone();
+                let mut client = worker_data.cache_origin_http.clone();
                 let mut use_proxy = worker_data.has_proxy;
                 'retry: for retry in 0..3 {
                     if stop.is_cancelled() {
@@ -216,13 +220,14 @@ pub(super) async fn hath(
                     let mut file = OpenOptions::new().write(true).open(&*path).await.map_err(|_| ())?;
                     file.seek(SeekFrom::Start(progress)).await.map_err(|_| ())?;
                     let source = &sources[retry % sources.len()];
-                    let request = tokio::select! {biased;_=stop.cancelled()=>return Err(()),result=client.get(source).send()=>result};
-                    let response = match request.and_then(|response| response.error_for_status()) {
+                    let request = client.get(source).header("hath-request", origin_auth.clone());
+                    let response = tokio::select! {biased;_=stop.cancelled()=>return Err(()),result=request.send()=>result};
+                    let response = match response.and_then(|response| response.error_for_status()) {
                         Ok(response) if response.status() == StatusCode::OK => response,
                         Ok(_) => continue,
                         Err(error) => {
                             if use_proxy && (error.is_connect() || retry == 1) {
-                                client = create_http_client(Duration::from_secs(30), None, worker_data.local_addr);
+                                client = create_cache_origin_http_client(None, worker_data.local_addr);
                                 use_proxy = false;
                             }
                             continue;

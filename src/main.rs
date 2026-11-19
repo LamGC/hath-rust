@@ -41,7 +41,7 @@ use crate::{
     metrics::Metrics,
     rpc::RPCClient,
     server::{Server, ServerOptions},
-    util::{create_dirs, create_http_client},
+    util::{create_cache_origin_http_client, create_dirs},
 };
 
 mod cache_jobs;
@@ -195,7 +195,7 @@ struct Args {
 type DownloadState = Mutex<HashMap<[u8; 20], (watch::Receiver<Option<Arc<TempPath>>>, Arc<watch::Sender<u64>>)>>;
 
 pub struct AppState {
-    reqwest: reqwest::Client,
+    cache_origin_http: reqwest::Client,
     rpc: Arc<RPCClient>,
     download_state: DownloadState,
     cache_manager: Arc<CacheManager>,
@@ -442,7 +442,7 @@ async fn run_client(
     let port = args.port.unwrap_or_else(|| init_settings.client_port());
     let cert = client.get_cert().await.ok_or("Failed to get server certificate")?;
     let state = AppState {
-        reqwest: create_http_client(Duration::from_secs(30), proxy.clone(), args.host),
+        cache_origin_http: create_cache_origin_http_client(proxy.clone(), args.host),
         rpc: client.clone(),
         download_state: Default::default(),
         cache_manager: cache_manager.clone(),

@@ -134,6 +134,10 @@ pub(crate) fn proxy_origin_length_issue(issue: ProxyOriginLengthIssue, expected:
     }
 }
 
+pub(crate) fn proxy_origin_redirect_blocked() {
+    log::warn!(target:SAFE_TARGET,"event=cache.proxy.redirect_cross_origin");
+}
+
 struct LoggerMessage {
     level: Level,
     message: String,

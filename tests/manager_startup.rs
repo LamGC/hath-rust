@@ -4,8 +4,9 @@ use aws_lc_rs::digest;
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::State,
-    http::{Response, StatusCode, Uri},
+    extract::{Path as RoutePath, State},
+    http::{HeaderMap, Response, StatusCode, Uri},
+    response::Redirect,
     routing::{get, post},
 };
 use serde_json::{Value, json};
@@ -47,6 +48,7 @@ impl Drop for ChildGuard {
 }
 struct Mock {
     address: String,
+    manager_endpoint: String,
     port: u16,
     cert: Vec<u8>,
     mode: Mode,
@@ -130,7 +132,8 @@ async fn serve(listener: tokio::net::TcpListener, router: Router, stop: Cancella
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
 }
-async fn control(State(mock): State<Arc<Mock>>, uri: Uri) -> Response<Body> {
+async fn control(State(mock): State<Arc<Mock>>, uri: Uri, headers: HeaderMap) -> Response<Body> {
+    assert!(!headers.contains_key("hath-request"));
     let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
     let q: HashMap<_, _> = url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
     let act = q["act"].as_str();
@@ -169,7 +172,7 @@ async fn control(State(mock): State<Arc<Mock>>, uri: Uri) -> Response<Body> {
             )
         }
         "fetchqueue" => "NO_PENDING_DOWNLOADS".into(),
-        "dlfetch" => signed(&format!("http://{}/image", mock.address)),
+        "dlfetch" => signed(&format!("http://{}/gallery-image", mock.address)),
         "srfetch" if add.starts_with("empty;") => signed(""),
         "srfetch" if add.starts_with("drain;") => signed(&format!("http://{}/stream", mock.address)),
         "srfetch" if add.starts_with("retry;") => {
@@ -178,7 +181,11 @@ async fn control(State(mock): State<Arc<Mock>>, uri: Uri) -> Response<Body> {
         "srfetch" if add.starts_with("resume;") => {
             signed(&format!("http://{0}/slow-prefix\nhttp://{0}/slow-prefix\nhttp://{0}/resumed", mock.address))
         }
-        "srfetch" if add.starts_with("length-fallback;") => signed(&format!("http://{0}/short-image\nhttp://{0}/image", mock.address)),
+        "srfetch" if add.starts_with("length-fallback;") => signed(&format!(
+            "http://{0}/short-image\nhttp://{0}/redirect-outside\nhttp://{0}/redirect-inside/{1}",
+            mock.address,
+            add.rsplit(';').next().unwrap()
+        )),
         "srfetch" if add.starts_with("length-invalid;") => signed(&format!("http://{}/short-image", mock.address)),
         "srfetch" if add.starts_with("missing;") => signed(&format!("http://{}/404", mock.address)),
         "srfetch" if add.starts_with("bad;") => signed(&format!("http://{}/bad-image", mock.address)),
@@ -290,6 +297,7 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
     let (tx, mut rx) = mpsc::channel(64);
     let mock = Arc::new(Mock {
         address: address.clone(),
+        manager_endpoint: endpoint.clone(),
         port,
         cert,
         mode,
@@ -306,8 +314,34 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
         .route("/16/rpc", get(control))
         .route("/16/dl", get(control))
         .route("/image", get(|| async { b"image-one".to_vec() }))
+        .route(
+            "/gallery-image",
+            get(|headers: HeaderMap| async move {
+                assert!(!headers.contains_key("hath-request"));
+                "image-one"
+            }),
+        )
         .route("/bad-image", get(|| async { b"image-two".to_vec() }))
         .route("/short-image", get(|| async { "bad" }))
+        .route(
+            "/redirect-outside",
+            get(|State(mock): State<Arc<Mock>>| async move { Redirect::temporary(&format!("{}redirect-trap", mock.manager_endpoint)) }),
+        )
+        .route(
+            "/redirect-inside/{id}",
+            get(|RoutePath(id): RoutePath<String>| async move { Redirect::temporary(&format!("/protected-image/{id}")) }),
+        )
+        .route(
+            "/protected-image/{id}",
+            get(|RoutePath(id): RoutePath<String>, headers: HeaderMap| async move {
+                let expected = format!("1001-{}", sha(format!("{KEY}{id}").as_bytes()));
+                if headers.get("hath-request").is_some_and(|header| header == expected.as_str()) {
+                    (StatusCode::OK, "image-one")
+                } else {
+                    (StatusCode::FORBIDDEN, "invalid origin authentication")
+                }
+            }),
+        )
         .route(
             "/slow-prefix",
             get(|| async {
@@ -350,6 +384,13 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
         .with_state(mock.clone());
     let control_task: JoinHandle<()> = tokio::spawn(serve(control_listener, router, stop.clone()));
     let router = Router::new()
+        .route(
+            "/redirect-trap",
+            get(|State(mock): State<Arc<Mock>>| async move {
+                mock.actions.lock().unwrap().push("redirect-trap".into());
+                "image-one"
+            }),
+        )
         .route("/rpc/v1/agents/register", post(manager))
         .route("/rpc/v1/agents/heartbeat", post(manager))
         .route("/rpc/v1/events/batch", post(manager))
@@ -722,6 +763,7 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
         result => result.unwrap(),
     }
     if mode == Mode::Normal {
+        assert!(!mock.actions.lock().unwrap().iter().any(|action| action == "redirect-trap"));
         for name in ["log/log_out", "log/log_err"] {
             let text = std::fs::read_to_string(root.path().join(name)).unwrap();
             assert!(!text.contains(KEY));
@@ -730,6 +772,7 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
             if name == "log/log_err" {
                 assert!(text.contains("event=cache.proxy.origin_length_mismatch attempt=1 expected=9 declared=3"));
                 assert!(text.contains("event=cache.proxy.origin_length_missing attempt=1 expected=9"));
+                assert!(text.contains("event=cache.proxy.redirect_cross_origin"));
             }
         }
     }
@@ -747,7 +790,7 @@ async fn exercise_image_http(http: &reqwest::Client, port: u16, root: &Path) {
     let id = format!("{hash}-9-jpg");
     let url = |id: &str, index: &str| image_url(port, id, index);
     let path = root.join("cache").join(&hash[..2]).join(&hash[2..4]).join(&id);
-    // A shorter first origin must not leave a prefix in the visitor response or the cache.
+    // Skip the short origin and the cross-origin redirect. The same-origin redirect must retain auth.
     let first = http.get(url(&id, "length-fallback")).send().await.unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(first.bytes().await.unwrap().as_ref(), b"image-one");

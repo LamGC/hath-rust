@@ -3,7 +3,7 @@ use std::{net::IpAddr, time::Duration};
 use aws_lc_rs::digest;
 use const_format::concatcp;
 use futures::future::try_join_all;
-use reqwest::Proxy;
+use reqwest::{ClientBuilder, Proxy, redirect::Policy};
 use rustls::{
     ClientConfig, RootCertStore,
     compress::CompressionCache,
@@ -21,6 +21,29 @@ pub fn string_to_hash(str: String) -> String {
 }
 
 pub fn create_http_client(timeout: Duration, proxy: Option<Proxy>, local_addr: Option<IpAddr>) -> reqwest::Client {
+    http_client_builder(timeout, proxy, local_addr).build().unwrap()
+}
+
+pub(crate) fn create_cache_origin_http_client(proxy: Option<Proxy>, local_addr: Option<IpAddr>) -> reqwest::Client {
+    let default_redirects = Policy::default();
+    http_client_builder(Duration::from_secs(30), proxy, local_addr)
+        .redirect(Policy::custom(move |attempt| {
+            // Reqwest does not strip custom authentication headers on cross-origin redirects.
+            let same_origin = attempt
+                .previous()
+                .first()
+                .is_some_and(|initial| initial.origin() == attempt.url().origin());
+            if !same_origin {
+                crate::logger::proxy_origin_redirect_blocked();
+                return attempt.stop();
+            }
+            default_redirects.redirect(attempt)
+        }))
+        .build()
+        .unwrap()
+}
+
+fn http_client_builder(timeout: Duration, proxy: Option<Proxy>, local_addr: Option<IpAddr>) -> ClientBuilder {
     let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let mut tls = ClientConfig::builder_with_provider(ssl_provider().into())
         .with_safe_default_protocol_versions()
@@ -29,7 +52,7 @@ pub fn create_http_client(timeout: Duration, proxy: Option<Proxy>, local_addr: O
         .with_no_client_auth();
     tls.cert_compression_cache = CompressionCache::Disabled.into(); // Client does not send certificate
 
-    let mut builder = reqwest::ClientBuilder::new()
+    let builder = ClientBuilder::new()
         .user_agent(concatcp!("Hentai@Home ", CLIENT_VERSION))
         .tls_backend_preconfigured(tls)
         .tcp_keepalive(Duration::from_secs(30))
@@ -45,12 +68,10 @@ pub fn create_http_client(timeout: Duration, proxy: Option<Proxy>, local_addr: O
         .local_address(local_addr);
 
     if let Some(proxy) = proxy {
-        builder = builder.proxy(proxy);
+        builder.proxy(proxy)
     } else {
-        builder = builder.no_proxy();
+        builder.no_proxy()
     }
-
-    builder.build().unwrap()
 }
 
 pub async fn create_dirs(dirs: Vec<&str>) -> Result<Vec<()>, std::io::Error> {
