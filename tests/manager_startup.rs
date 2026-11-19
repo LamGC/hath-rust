@@ -178,6 +178,8 @@ async fn control(State(mock): State<Arc<Mock>>, uri: Uri) -> Response<Body> {
         "srfetch" if add.starts_with("resume;") => {
             signed(&format!("http://{0}/slow-prefix\nhttp://{0}/slow-prefix\nhttp://{0}/resumed", mock.address))
         }
+        "srfetch" if add.starts_with("length-fallback;") => signed(&format!("http://{0}/short-image\nhttp://{0}/image", mock.address)),
+        "srfetch" if add.starts_with("length-invalid;") => signed(&format!("http://{}/short-image", mock.address)),
         "srfetch" if add.starts_with("missing;") => signed(&format!("http://{}/404", mock.address)),
         "srfetch" if add.starts_with("bad;") => signed(&format!("http://{}/bad-image", mock.address)),
         "srfetch" => signed(&format!("http://{}/image", mock.address)),
@@ -305,6 +307,7 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
         .route("/16/dl", get(control))
         .route("/image", get(|| async { b"image-one".to_vec() }))
         .route("/bad-image", get(|| async { b"image-two".to_vec() }))
+        .route("/short-image", get(|| async { "bad" }))
         .route(
             "/slow-prefix",
             get(|| async {
@@ -724,6 +727,10 @@ async fn scenario_inner(mode: Mode, slow_retry: bool) {
             assert!(!text.contains(KEY));
             assert!(!text.contains("keystamp"));
             assert!(!text.contains("127.0.0.1"));
+            if name == "log/log_err" {
+                assert!(text.contains("event=cache.proxy.origin_length_mismatch attempt=1 expected=9 declared=3"));
+                assert!(text.contains("event=cache.proxy.origin_length_missing attempt=1 expected=9"));
+            }
         }
     }
 }
@@ -740,7 +747,8 @@ async fn exercise_image_http(http: &reqwest::Client, port: u16, root: &Path) {
     let id = format!("{hash}-9-jpg");
     let url = |id: &str, index: &str| image_url(port, id, index);
     let path = root.join("cache").join(&hash[..2]).join(&hash[2..4]).join(&id);
-    let first = http.get(url(&id, "valid")).send().await.unwrap();
+    // A shorter first origin must not leave a prefix in the visitor response or the cache.
+    let first = http.get(url(&id, "length-fallback")).send().await.unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(first.bytes().await.unwrap().as_ref(), b"image-one");
     timeout(Duration::from_secs(5), async {
@@ -776,6 +784,7 @@ async fn exercise_image_http(http: &reqwest::Client, port: u16, root: &Path) {
     // Empty source sets are ordinary misses, never a worker panic or an infinite body.
     assert_eq!(http.get(url(&bad_id, "empty")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
     assert_eq!(http.get(url(&bad_id, "missing")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert_eq!(http.get(url(&bad_id, "length-invalid")).send().await.unwrap().status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

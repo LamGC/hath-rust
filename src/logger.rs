@@ -112,6 +112,28 @@ impl Diagnostic {
 pub(crate) fn event(code: Diagnostic) {
     log::info!(target:SAFE_TARGET,"event={}",code.code());
 }
+
+pub(crate) enum ProxyOriginLengthIssue {
+    Missing,
+    Mismatch(u64),
+    Invalid,
+}
+
+pub(crate) fn proxy_origin_length_issue(issue: ProxyOriginLengthIssue, expected: u64, attempt: usize) {
+    // Do not log origin URLs, file identifiers, or the raw header value.
+    match issue {
+        ProxyOriginLengthIssue::Missing => {
+            log::warn!(target:SAFE_TARGET,"event=cache.proxy.origin_length_missing attempt={attempt} expected={expected}")
+        }
+        ProxyOriginLengthIssue::Mismatch(declared) => {
+            log::warn!(target:SAFE_TARGET,"event=cache.proxy.origin_length_mismatch attempt={attempt} expected={expected} declared={declared}")
+        }
+        ProxyOriginLengthIssue::Invalid => {
+            log::warn!(target:SAFE_TARGET,"event=cache.proxy.origin_length_invalid attempt={attempt} expected={expected}")
+        }
+    }
+}
+
 struct LoggerMessage {
     level: Level,
     message: String,

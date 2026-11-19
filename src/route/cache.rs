@@ -31,6 +31,7 @@ use tokio::{
 use crate::{
     AppState,
     cache_manager::{CacheFileInfo, CacheFileResult},
+    logger::{ProxyOriginLengthIssue, proxy_origin_length_issue},
     metrics::{LABEL_CACHE_DOWNLOAD, LABEL_CACHE_FETCH_URL},
     route::{forbidden, not_found, parse_additional},
     server::util::TruncateBody,
@@ -227,6 +228,10 @@ pub(super) async fn hath(
                             continue;
                         }
                     };
+                    // Reject a known bad source before its bytes can reach the shared tempfile or visitors.
+                    if !accept_proxy_origin_length(response.headers(), file_size, retry + 1) {
+                        continue;
+                    }
                     let mut stream = response.bytes_stream();
                     let mut downloaded = 0u64;
                     while let Some(chunk) = tokio::select! {biased;_=stop.cancelled()=>return Err(()),chunk=stream.next()=>chunk} {
@@ -322,6 +327,20 @@ pub(super) async fn hath(
     image_response(result, false, file_size)
 }
 
+fn accept_proxy_origin_length(headers: &HeaderMap, expected: u64, attempt: usize) -> bool {
+    let Some(value) = headers.get(CONTENT_LENGTH) else {
+        // Keep unknown-length origins compatible; the worker still checks byte count and hash.
+        proxy_origin_length_issue(ProxyOriginLengthIssue::Missing, expected, attempt);
+        return true;
+    };
+    match value.to_str().ok().and_then(|text| text.parse::<u64>().ok()) {
+        Some(declared) if declared == expected => return true,
+        Some(declared) => proxy_origin_length_issue(ProxyOriginLengthIssue::Mismatch(declared), expected, attempt),
+        None => proxy_origin_length_issue(ProxyOriginLengthIssue::Invalid, expected, attempt),
+    }
+    false
+}
+
 async fn write_proxy_chunk(file: &mut File, bytes: &[u8], end: u64, file_size: u64, visible: &watch::Sender<u64>) -> std::io::Result<()> {
     file.write_all(bytes).await?;
     // Tokio can return from write_all with the last write still queued. Readers use a separate file handle.
@@ -356,6 +375,22 @@ fn image_response(response: Response, local: bool, bytes: u64) -> Response {
 mod tests {
     use super::*;
     use std::io::Read;
+
+    #[test]
+    fn proxy_origin_length_rejects_mismatches_but_allows_missing_headers() {
+        let mut headers = HeaderMap::new();
+        assert!(accept_proxy_origin_length(&headers, 262144, 1));
+        for (value, accepted) in [
+            ("262144", true),
+            ("65536", false),
+            ("262145", false),
+            ("0", false),
+            ("invalid", false),
+        ] {
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static(value));
+            assert_eq!(accept_proxy_origin_length(&headers, 262144, 2), accepted, "{value}");
+        }
+    }
 
     #[test]
     fn proxy_progress_only_announces_readable_bytes() {
