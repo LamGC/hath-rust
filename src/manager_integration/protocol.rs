@@ -16,6 +16,7 @@ pub(super) const REQUIRED: [&str; 5] = [
 ];
 pub(super) const MAX_RESPONSE: usize = 64 * 1024;
 pub(super) const EXTERNAL_CAPABILITY: &str = "external.session.v1";
+pub(super) const DOWNLOAD_PROGRESS_CAPABILITY: &str = "gallery.download.progress.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -73,7 +74,11 @@ impl Offer {
         Self {
             major: 1,
             minor: 0,
-            capabilities: REQUIRED.into_iter().chain(["telemetry.v1"]).map(str::to_owned).collect(),
+            capabilities: REQUIRED
+                .into_iter()
+                .chain(["telemetry.v1", DOWNLOAD_PROGRESS_CAPABILITY])
+                .map(str::to_owned)
+                .collect(),
             required_capabilities: REQUIRED.map(str::to_owned).to_vec(),
             output_profile: PROFILE.into(),
         }
@@ -281,6 +286,15 @@ impl<'de> Visitor<'de> for JsonSeed {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn with_download_progress(mut legacy: Value) -> Value {
+        let capabilities = legacy["protocol"]["capabilities"].as_array_mut().unwrap();
+        let index = capabilities
+            .iter()
+            .position(|cap| cap == EXTERNAL_CAPABILITY)
+            .unwrap_or(capabilities.len());
+        capabilities.insert(index, Value::String(DOWNLOAD_PROGRESS_CAPABILITY.into()));
+        legacy
+    }
     #[test]
     fn external_registration_matches_shared_fixture_and_cannot_downgrade() {
         let expected: Value = serde_json::from_str(include_str!("fixtures/agent-registration-external-rust-v1.json")).unwrap();
@@ -288,7 +302,7 @@ mod tests {
         let mut external: ExternalIdentity = serde_json::from_value(expected["externalIdentity"].clone()).unwrap();
         external.validate().unwrap();
         let registration = Registration::external(expected["instanceId"].as_str().unwrap(), &identity, &external);
-        assert_eq!(serde_json::to_value(registration).unwrap(), expected);
+        assert_eq!(serde_json::to_value(registration).unwrap(), with_download_progress(expected.clone()));
         external.purpose = "replay".into();
         let replay = serde_json::to_value(Registration::external(expected["instanceId"].as_str().unwrap(), &identity, &external)).unwrap();
         assert_eq!(replay["nativeIdentity"], expected["nativeIdentity"]);
@@ -329,7 +343,7 @@ mod tests {
         );
         let expected: Value = serde_json::from_str(include_str!("fixtures/agent-registration-native-v1.json")).unwrap();
         let identity: NativeIdentity = serde_json::from_value(expected["nativeIdentity"].clone()).unwrap();
-        assert_eq!(serde_json::to_value(Registration::new("run-native", &identity)).unwrap(), expected);
+        assert_eq!(serde_json::to_value(Registration::new("run-native", &identity)).unwrap(), with_download_progress(expected));
     }
     #[test]
     fn ack_is_strict_and_batch_bound() {

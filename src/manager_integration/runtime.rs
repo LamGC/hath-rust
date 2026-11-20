@@ -25,6 +25,7 @@ use tokio::{
 const PENDING_RECORDS: usize = 64;
 const PENDING_BYTES: usize = 256 * 1024;
 const MAX_SNAPSHOT: usize = 60 * 1024;
+const DOWNLOAD_PROGRESS_TTL: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy)]
 pub(super) enum Phase {
@@ -57,6 +58,7 @@ struct State {
     telemetry_failures: AtomicU64,
     wake: Arc<Notify>,
     snapshot: watch::Sender<Option<Arc<Snapshot>>>,
+    progress: parking_lot::Mutex<Option<DownloadProgress>>,
 }
 struct PersistenceHealth(Arc<State>);
 impl Drop for PersistenceHealth {
@@ -106,6 +108,21 @@ struct Snapshot {
     payload: Value,
 }
 
+#[derive(Clone)]
+pub(super) struct DownloadProgress {
+    pub attempt: Arc<str>,
+    pub sequence: i64,
+    pub completed: usize,
+    pub total: usize,
+    observed_at: Instant,
+}
+
+impl DownloadProgress {
+    fn pending(&self, last_sent: Option<i64>) -> bool {
+        Some(self.sequence) != last_sent && self.observed_at.elapsed() < DOWNLOAD_PROGRESS_TTL
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct IntegrationHandle {
     inner: Option<Arc<Enabled>>,
@@ -116,6 +133,28 @@ struct Enabled {
     storage: Storage,
 }
 impl IntegrationHandle {
+    pub(super) fn download_progress(&self, attempt: &Arc<str>, completed: usize, total: usize) {
+        let Some(enabled) = &self.inner else { return };
+        let state = &enabled.state;
+        let mut latest = state.progress.lock();
+        if completed > total
+            || latest
+                .as_ref()
+                .is_some_and(|old| old.attempt == *attempt && old.completed >= completed)
+        {
+            return;
+        }
+        let Ok(sequence) = state.sequence() else { return };
+        *latest = Some(DownloadProgress {
+            attempt: attempt.clone(),
+            sequence,
+            completed,
+            total,
+            observed_at: Instant::now(),
+        });
+        drop(latest);
+        state.wake.notify_one();
+    }
     pub(super) fn telemetry_failures(&self) -> Option<u64> {
         self.inner.as_ref().map(|enabled| enabled.state.telemetry_failures.load(Relaxed))
     }
@@ -326,6 +365,7 @@ impl Runtime {
             telemetry_failures: AtomicU64::new(0),
             wake: Arc::new(Notify::new()),
             snapshot,
+            progress: parking_lot::Mutex::new(None),
         });
         // native.health.v1 is required even when telemetry.v1 was not negotiated.
         let heartbeat = config.heartbeat_interval().min(Duration::from_secs(30));
@@ -729,6 +769,8 @@ async fn run(
     let mut backoff = Backoff(1000);
     let mut last_snapshot_sent = None;
     let mut telemetry_backoff = Backoff(1000);
+    let mut last_progress_sent = None;
+    let mut progress_at = Instant::now();
     loop {
         let step = async {
             if !transport.has_session() {
@@ -736,6 +778,7 @@ async fn run(
                 heartbeat_at = Instant::now();
                 snapshot_at = Instant::now();
                 last_snapshot_sent = None;
+                last_progress_sent = None;
             }
             let health_dirty = state.health_dirty.swap(false, Relaxed);
             if Instant::now() >= heartbeat_at || health_dirty {
@@ -780,6 +823,16 @@ async fn run(
                 result?;
                 storage.ack(records).await?;
             }
+            if !more && Instant::now() >= progress_at {
+                let pending = state.progress.lock().clone().filter(|sample| sample.pending(last_progress_sent));
+                if let Some(sample) = pending {
+                    progress_at = Instant::now() + Duration::from_secs(1);
+                    if matches!(tokio::time::timeout(Duration::from_millis(750), transport.download_progress(&sample)).await, Ok(Ok(true)))
+                    {
+                        last_progress_sent = Some(sample.sequence);
+                    }
+                }
+            }
             Ok::<_, io::Error>(replay.tick(storage).await || more)
         };
         let outcome = tokio::select! {
@@ -804,11 +857,20 @@ async fn run(
                 if more {
                     continue;
                 }
+                let deadline = heartbeat_at
+                    .min(snapshot_at)
+                    .min(refresh_at)
+                    .min(replay.deadline().unwrap_or(refresh_at));
+                let has_progress = state
+                    .progress
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|sample| sample.pending(last_progress_sent));
                 tokio::select! {
                     biased;
                     _ = stop.wait_for(|stop| *stop) => break,
                     _ = state.wake.notified() => (),
-                    _ = sleep_until(heartbeat_at.min(snapshot_at).min(refresh_at).min(replay.deadline().unwrap_or(refresh_at))) => (),
+                    _ = sleep_until(if has_progress { deadline.min(progress_at) } else { deadline }) => (),
                 }
             }
         }

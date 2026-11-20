@@ -253,6 +253,13 @@ impl GalleryAttempt {
         self.handle.persist(&self.journal.initialized).await
     }
 
+    pub(crate) fn progress_reporter(&self) -> impl Fn(usize) + Clone + Send + 'static {
+        let attempt = Arc::<str>::from(self.journal.attempt_id.as_str());
+        let total = self.description.files.len();
+        let handle = self.handle.clone();
+        move |completed| handle.download_progress(&attempt, completed, total)
+    }
+
     pub(crate) async fn active(&mut self) {
         if self.last_active.elapsed() < std::time::Duration::from_secs(30) || self.ready.is_some() {
             return;

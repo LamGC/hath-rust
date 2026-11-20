@@ -159,6 +159,12 @@ impl GalleryDownloader {
 
             // Download files
             let downloaded_files = Arc::new(Mutex::new(HashMap::new()));
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            let progress = attempt.as_ref().map(|attempt| attempt.progress_reporter());
+            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+            if let Some(report) = &progress {
+                report(0);
+            }
             'retry: for retry in 0..10 {
                 let mut writers = JoinSet::new();
                 let use_proxy = retry != 0 && self.proxy.is_some();
@@ -188,7 +194,12 @@ impl GalleryDownloader {
                     )
                     .await;
                     if verified && let Ok(metadata) = fs::metadata(&path).await {
-                        downloaded_files.lock().insert(info, metadata.len());
+                        let mut files = downloaded_files.lock();
+                        files.insert(info, metadata.len());
+                        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                        if let Some(report) = &progress {
+                            report(files.len());
+                        }
                         continue;
                     }
 
@@ -224,6 +235,8 @@ impl GalleryDownloader {
                             let metrics = self.metrics.clone();
                             let local_addr = self.local_addr;
                             let stop = stop.clone();
+                            #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                            let progress = progress.clone();
                             writers.spawn(async move {
                                 for retry in 0..3 {
                                     if stop.is_cancelled() {
@@ -267,7 +280,12 @@ impl GalleryDownloader {
                                             "Finished downloading gid={} page={}: {}.{}",
                                             meta.gid, info.page, info.filename, info.filetype
                                         );
-                                        downloaded_files.lock().insert(info, result.unwrap());
+                                        let mut files = downloaded_files.lock();
+                                        files.insert(info, result.unwrap());
+                                        #[cfg(all(feature = "manager-integration", target_os = "linux"))]
+                                        if let Some(report) = &progress {
+                                            report(files.len());
+                                        }
                                         break;
                                     }
                                 }

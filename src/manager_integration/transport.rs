@@ -163,6 +163,24 @@ impl Transport {
         protocol::acknowledge(&reply, None).map_err(invalid)
     }
 
+    #[cfg(target_os = "linux")]
+    pub async fn download_progress(&mut self, sample: &super::runtime::DownloadProgress) -> io::Result<bool> {
+        self.require_live()?;
+        let session = self.session.as_ref().ok_or_else(|| invalid("manager_session_required"))?;
+        if !session.capabilities.contains(protocol::DOWNLOAD_PROGRESS_CAPABILITY) {
+            return Ok(true);
+        }
+        let body = serde_json::to_vec(&json!({"instanceId":self.instance,"downloadAttemptId":sample.attempt.as_ref(),
+            "sequence":sample.sequence,"completedPages":sample.completed,"totalPages":sample.total}))
+        .map_err(|_| invalid("manager_progress_invalid"))?;
+        let reply = self.post("gallery-progress", body, false).await?;
+        let value: serde_json::Value = protocol::decode(&reply).map_err(invalid)?;
+        value
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| invalid("manager_progress_ack"))
+    }
+
     fn require_live(&self) -> io::Result<()> {
         if self
             .config
@@ -192,7 +210,9 @@ impl Transport {
         }
         let reply = request.send().await.map_err(|_| invalid("manager_transport_unavailable"))?;
         if !reply.status().is_success() {
-            if matches!(reply.status().as_u16(), 401 | 403 | 409 | 426 | 503) {
+            // Only a reliable channel can invalidate the negotiated session;
+            // an optional progress route may be unavailable independently.
+            if path != "gallery-progress" && matches!(reply.status().as_u16(), 401 | 403 | 409 | 426 | 503) {
                 self.session = None;
             }
             return Err(invalid("manager_http_rejected"));
@@ -275,6 +295,7 @@ mod tests {
         .to_string();
         let (url, task) = server(vec![
             (200, accepted.clone()),
+            (503, "{}".into()),
             (401, "{}".into()),
             (200, accepted.clone()),
             (200, accepted),
@@ -302,6 +323,8 @@ mod tests {
         };
         let mut transport = Transport::new(&config).unwrap();
         transport.register(&identity).await.unwrap();
+        assert!(transport.post("gallery-progress", b"{}".to_vec(), false).await.is_err());
+        assert!(transport.has_session());
         assert!(transport.heartbeat(1, "active", None).await.is_err());
         assert!(!transport.has_session());
         std::fs::write(&token, "malformed").unwrap();
@@ -322,14 +345,17 @@ mod tests {
             .unwrap();
         replay.send_events(&spool.batch().unwrap()).await.unwrap();
         let requests = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert!(requests[0].contains(&format!("Bearer {}", "A".repeat(32))));
-        for request in &requests[2..] {
+        for request in &requests[3..] {
             assert!(request.contains(&format!("Bearer {}", "B".repeat(32))));
         }
-        let registration: serde_json::Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let mut registration: serde_json::Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let offered = registration["protocol"]["capabilities"].as_array_mut().unwrap();
+        assert!(offered.iter().any(|v| v == protocol::DOWNLOAD_PROGRESS_CAPABILITY));
+        offered.retain(|v| v != protocol::DOWNLOAD_PROGRESS_CAPABILITY);
         assert_eq!(registration, fixture);
-        let historical: serde_json::Value = serde_json::from_str(requests[3].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let historical: serde_json::Value = serde_json::from_str(requests[4].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(historical["externalIdentity"]["purpose"], "replay");
         assert_eq!(historical["instanceId"], registration["instanceId"]);
         assert_eq!(historical["nativeIdentity"], registration["nativeIdentity"]);
