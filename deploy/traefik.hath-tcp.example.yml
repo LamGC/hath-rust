@@ -1,0 +1,22 @@
+# Traefik v3 dynamic file configuration. Keep the existing HTTP routers.
+# Enable only after verifying that all required H@H clients send matching SNI.
+tcp:
+  routers:
+    hath:
+      entryPoints: [websecure]
+      rule: 'HostSNIRegexp(`(?i)(^|\.)hath\.network\.?$`)'
+      tls:
+        passthrough: true
+      service: hath
+
+  services:
+    hath:
+      loadBalancer:
+        serversTransport: hath-proxy-v2
+        servers:
+          - address: 'hath:11443'
+
+  serversTransports:
+    hath-proxy-v2:
+      proxyProtocol:
+        version: 2

@@ -31,7 +31,7 @@ use rustls::{
 };
 use tokio::{
     net::{TcpListener, TcpSocket, TcpStream},
-    sync::watch,
+    sync::{Semaphore, watch},
     task::JoinHandle,
     time::timeout,
 };
@@ -48,10 +48,14 @@ use crate::{
     server::{cert::CertStore, util::FloodControl},
     util::{aes_support, ssl_provider},
 };
+pub(crate) use proxy_protocol::TrustedProxy;
 
 mod cert;
 mod date_header;
 mod h3_quinn;
+#[cfg(all(test, target_os = "linux"))]
+mod proxy_ingress_tests;
+mod proxy_protocol;
 pub mod util;
 
 pub struct Server {
@@ -70,6 +74,7 @@ pub struct ServerOptions {
     sni_strict: bool,
     server_header: bool,
     h3: bool,
+    trusted_tcp_proxies: Vec<TrustedProxy>,
 }
 
 impl ServerOptions {
@@ -84,6 +89,7 @@ impl ServerOptions {
             sni_strict: false,
             server_header: true,
             h3: false,
+            trusted_tcp_proxies: Vec::new(),
         }
     }
 
@@ -109,6 +115,11 @@ impl ServerOptions {
 
     pub fn h3(mut self, enabled: bool) -> Self {
         self.h3 = enabled;
+        self
+    }
+
+    pub(crate) fn trusted_tcp_proxies(mut self, sources: Vec<TrustedProxy>) -> Self {
+        self.trusted_tcp_proxies = sources;
         self
     }
 }
@@ -167,8 +178,12 @@ impl Server {
         };
 
         // Accept loop
-        let h3_port = endpoint.as_ref().map(|_| port);
-        let accept_task = tokio::spawn(accept_loop(handle.clone(), listener, acceptor, http, router.clone(), flood_control, h3_port));
+        let ingress = TcpIngress {
+            flood_control,
+            h3_port: endpoint.as_ref().map(|_| port),
+            trusted_proxies: option.trusted_tcp_proxies,
+        };
+        let accept_task = tokio::spawn(accept_loop(handle.clone(), listener, acceptor, http, router.clone(), ingress));
         let accept_task_h3 = endpoint.map(|endpoint| tokio::spawn(accept_loop_h3(handle.clone(), endpoint, router, flood_control)));
 
         Some(Self {
@@ -307,49 +322,87 @@ fn http_connection_event(result: Result<(), hyper::Error>) -> TcpConnectionEvent
     if error.is_incomplete_message() { HttpPeerClosed } else { HttpError }
 }
 
+struct TcpIngress {
+    flood_control: bool,
+    h3_port: Option<u16>,
+    trusted_proxies: Vec<TrustedProxy>,
+}
+
+fn reject_flooded(stream: &TcpStream, metrics: &TcpConnectionMetrics) {
+    metrics.record(TcpConnectionEvent::FloodBlocked);
+    let _ = stream.set_zero_linger(); // RST connection
+}
+
 async fn accept_loop(
     handle: Arc<ServerHandle>,
     mut listener: TcpListener,
     acceptor: TlsAcceptor,
     http: http1::Builder,
     mut router: Router,
-    flood_control: bool,
-    h3_port: Option<u16>,
+    ingress: TcpIngress,
 ) {
     let (shutdown_tx, _) = watch::channel(());
     let metrics = &handle.tcp_metrics;
-    let mut flood_control = if flood_control { Some(FloodControl::new()) } else { None };
+    let proxy_enabled = !ingress.trusted_proxies.is_empty();
+    let pending_proxy_headers = proxy_enabled.then(|| Arc::new(Semaphore::new(proxy_protocol::MAX_PENDING_HEADERS)));
+    let mut direct_flood = (ingress.flood_control && !proxy_enabled).then(FloodControl::new);
+    // Mixed direct and proxied connections must account against the same client IP table.
+    let shared_flood = (ingress.flood_control && proxy_enabled).then(|| Arc::new(Mutex::new(FloodControl::new())));
     // Add h3 Alt-svc header
-    if let Some(port) = h3_port {
+    if let Some(port) = ingress.h3_port {
         let value = HeaderValue::from_str(&format!("h3=\":{}\"; persist=1", port)).unwrap();
         let h3_header = SetResponseHeaderLayer::appending(ALT_SVC, value);
         router = router.layer(h3_header)
     }
     loop {
-        // Wait for new tcp connection
-        let (stream, addr) = tokio::select! {
+        let (stream, peer) = tokio::select! {
             biased;
             _ = handle.shutdown.cancelled() => break,
             result = accept(&mut listener, metrics) => result,
         };
         metrics.record(TcpConnectionEvent::Accepted);
 
-        // Flood control
-        if flood_control.as_mut().is_some_and(|fc| fc.hit(addr)) {
-            metrics.record(TcpConnectionEvent::FloodBlocked);
-            // Flood detected
-            let _ = stream.set_zero_linger(); // RST connection
-            drop(stream);
-            continue;
-        }
+        // Only the real socket peer selects the ingress path. A trusted connection
+        // parses its bounded header in the same task that will handle TLS and HTTP.
+        let proxy = if let Some(slots) = &pending_proxy_headers
+            && ingress.trusted_proxies.iter().any(|source| source.contains(peer.ip()))
+        {
+            let Ok(permit) = slots.clone().try_acquire_owned() else { continue };
+            Some((permit, shared_flood.clone()))
+        } else {
+            if direct_flood.as_mut().is_some_and(|flood| flood.hit(peer))
+                || shared_flood.as_ref().is_some_and(|flood| flood.lock().hit(peer))
+            {
+                reject_flooded(&stream, metrics);
+                continue;
+            }
+            None
+        };
 
         // Process connection
         let acceptor = acceptor.clone();
         let http = http.clone();
         let metrics = metrics.clone();
-        let service = Extension(ClientAddr(addr)).layer(router.clone());
+        let router = router.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
+            let (stream, addr) = if let Some((permit, flood)) = proxy {
+                let accepted = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => return,
+                    result = proxy_protocol::accept_proxy_header(stream) => result,
+                };
+                drop(permit);
+                let Some((stream, addr)) = accepted else { return };
+                if flood.is_some_and(|flood| flood.lock().hit(addr)) {
+                    reject_flooded(&stream, &metrics);
+                    return;
+                }
+                (stream, addr)
+            } else {
+                (stream, peer)
+            };
+
             // TLS handshake
             let ssl_stream = match timeout(Duration::from_secs(10), acceptor.accept(stream)).await {
                 Ok(Ok(s)) => {
@@ -375,6 +428,7 @@ async fn accept_loop(
 
             // Process request
             let stream = TokioIo::new(ssl_stream); // Tokio to hyper trait
+            let service = Extension(ClientAddr(addr)).layer(router);
             let service = TowerToHyperService::new(service); // Tower to hyper trait
             let connection = http.serve_connection(stream, service);
             pin_mut!(connection);

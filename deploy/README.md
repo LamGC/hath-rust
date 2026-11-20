@@ -41,7 +41,26 @@ docker compose -f compose.standalone.yml logs --tail 100 -f
 
 停止使用 `docker compose -f compose.standalone.yml down`，不删除数据目录。
 `1.20.0` 的 External 配置与独立 man-agent 部署示例在配套 hath-manager 仓库的 `deploy/containers/`；
-本页继续只说明已发布的独立运行版。不要为了接入 Manager 把同一数据目录交给另一个 Managed 实例启动。
+不要为了接入 Manager 把同一数据目录交给另一个 Managed 实例启动。
+
+## 可选：Traefik TCP 透传与 PROXY protocol v2
+
+需要包含 PROXY protocol v2 支持的客户端构建；这项能力不依赖 Manager。不开启时原有直连方式不变。
+启用时在现有参数后加 `--proxy-protocol-v2 --trusted-proxy <Traefik 后端 IP>`。
+`--trusted-proxy` 可重复，接受精确 IP 或网络地址形式的 CIDR（如 `192.0.2.0/24`）；带主机位的 CIDR 会被拒绝。
+优先用 Traefik 在专用后端网络上的精确 IP，不信任公共网段或整个共享网络。
+
+- 可信对端必须先发送 PROXY v2 的 TCP/IPv4 或 TCP/IPv6 头，再发送 TLS。缺失、无效或超时都会断开。
+- 其他对端直接进入原有 TLS 流程，不解析 PROXY 头。合法 TLS 直连不变，带 PROXY 头的直连不会通过握手。
+- TLS 握手、证书和现有 IP 校验继续由 hath-rust 处理。此配置只处理 TCP，不能同时使用 `--enable-h3`；避免向访客通告 Traefik 并未转发的 UDP 端点。
+
+可参考 [Traefik v3 动态配置示例](traefik.hath-tcp.example.yml)，将 `hath:11443` 和 entrypoint 换成实际地址与名称。
+示例在 `websecure` 上透传 `hath.network` 及子域名的 SNI；不要在共用入口放接管所有 TLS 的兜底匹配。
+使用独立后端网络，让 Traefik 能访问 hath-rust 的 TCP 端口，并确保 hath-rust 实际看到的 TCP 对端 IP 等于可信配置。
+不要让普通直连经 SNAT 后看起来也来自这个可信地址；否则 hath-rust 无法区分它们和代理流量。
+
+先用测试入口验证图片、测速和控制请求。此前保持 EH 登记端口及直连配置不变。
+只有确认实际 H@H 请求都带有可匹配的 SNI 后，才共用公网 `443` 并同步调整 EH 登记的端口；否则继续使用独立端口。
 
 ## 本地构建
 

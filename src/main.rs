@@ -40,7 +40,7 @@ use crate::{
     logger::{Diagnostic, Logger},
     metrics::Metrics,
     rpc::RPCClient,
-    server::{Server, ServerOptions},
+    server::{Server, ServerOptions, TrustedProxy},
     util::{create_cache_origin_http_client, create_dirs},
 };
 
@@ -178,6 +178,14 @@ struct Args {
     /// Enable metrics endpoint
     #[arg(long, default_value_t = false)]
     enable_metrics: bool,
+
+    /// Read a PROXY protocol v2 header on TCP connections from explicitly trusted peers
+    #[arg(long, requires = "trusted_proxy", conflicts_with = "enable_h3")]
+    proxy_protocol_v2: bool,
+
+    /// Trusted proxy TCP peer address or CIDR; repeat to allow more than one
+    #[arg(long, requires = "proxy_protocol_v2", value_name = "IP_OR_CIDR")]
+    trusted_proxy: Vec<TrustedProxy>,
 
     /// Deprecated: replace by --disable-server-header
     #[arg(long, default_value_t = false, hide = true)]
@@ -458,6 +466,7 @@ async fn run_client(
             .metrics(args.enable_metrics)
             .sni_strict(args.sni_strict)
             .server_header(!args.disable_server_header)
+            .trusted_tcp_proxies(if args.proxy_protocol_v2 { args.trusted_proxy } else { Vec::new() })
             .h3(args.enable_h3),
     ) else {
         error!("Server start failed.");
@@ -871,5 +880,32 @@ fn switch_window(hide: bool) {
                 let _ = unsafe { PostMessageW(Some(window), WM_SETICON, WPARAM(ICON_BIG as _), LPARAM(icon.0 as _)) };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_protocol_args_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_protocol_requires_an_explicit_switch_and_a_trusted_peer() {
+        let direct = Args::try_parse_from(["hath-rust"]).unwrap();
+        assert!(!direct.proxy_protocol_v2);
+        assert!(direct.trusted_proxy.is_empty());
+        assert!(Args::try_parse_from(["hath-rust", "--proxy-protocol-v2"]).is_err());
+        assert!(Args::try_parse_from(["hath-rust", "--trusted-proxy", "127.0.0.2"]).is_err());
+        assert!(Args::try_parse_from(["hath-rust", "--enable-h3"]).is_ok());
+        assert!(Args::try_parse_from(["hath-rust", "--proxy-protocol-v2", "--trusted-proxy", "127.0.0.2", "--enable-h3"]).is_err());
+        let proxy = Args::try_parse_from([
+            "hath-rust",
+            "--proxy-protocol-v2",
+            "--trusted-proxy",
+            "127.0.0.2",
+            "--trusted-proxy",
+            "2001:db8::/64",
+        ])
+        .unwrap();
+        assert!(proxy.proxy_protocol_v2);
+        assert_eq!(proxy.trusted_proxy.len(), 2);
     }
 }
